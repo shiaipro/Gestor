@@ -1,0 +1,21 @@
+{
+  "name": "SHIAI PRO Gestor",
+  "short_name": "SHIAIPRO",
+  "description": "Sistema de Gestão SHIAI PRO",
+  "start_url": "/Gestor/login.php",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#133080",
+  "icons": [
+    {
+      "src": "/Gestor/assets/img/logo.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/Gestor/assets/img/logo.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

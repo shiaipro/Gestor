@@ -1,0 +1,149 @@
+/* Custom Theme - Neon Lime & Light Fields */
+
+:root {
+    --brand: #133080;
+    --brand-dark: #133080;
+    --brand-darker: #133080;
+    --brand-light: #7f9cff;
+    --brand-bg: #f0f7ff;
+    --brand-muted: rgba(19, 48, 128, .1);
+
+    --primary: var(--brand) !important;
+    --primary-lime: var(--brand) !important;
+}
+
+/* Force Light Form Controls */
+.form-control,
+input.form-control,
+select.form-control,
+textarea.form-control,
+input[type="text"].form-control,
+input[type="date"].form-control,
+input[type="time"].form-control,
+input[type="number"].form-control,
+select.form-control {
+    background-color: #f8fafc !important;
+    color: #08153a111 !important;
+    border: 1px solid #e2e8f0 !important;
+    border-radius: 12px !important;
+    padding: 12px 16px !important;
+    font-family: var(--ff-main) !important;
+}
+
+.form-control:focus,
+input.form-control:focus,
+select.form-control:focus {
+    border-color: var(--brand) !important;
+    box-shadow: 0 0 0 4px var(--brand-muted) !important;
+    outline: none !important;
+}
+
+/* Theme Accents */
+.nav-item.active,
+.nav-item.active i,
+.btn-nav-top.active,
+.btn-nav-top.active i,
+.logo i,
+.logo span span {
+    color: var(--brand) !important;
+}
+
+.sidebar .nav-item.active {
+    background-color: var(--brand) !important;
+    color: #ffffff !important;
+}
+
+.sidebar .nav-item.active i {
+    color: #ffffff !important;
+}
+
+.btn-primary {
+    background: var(--brand) !important;
+    border: none !important;
+    color: #ffffff !important;
+}
+
+.btn-primary:hover {
+    background: var(--brand-dark) !important;
+    color: #ffffff !important;
+}
+
+/* Form Spacing Improvements */
+.form-group {
+    margin-bottom: 24px !important;
+}
+
+.form-group label {
+    display: block !important;
+    margin-bottom: 10px !important;
+    font-weight: 600 !important;
+    color: #444 !important;
+    font-size: var(--fs-base) !important;
+}
+
+/* Layout Adjustments */
+.full-width-layout {
+    width: 100% !important;
+    max-width: none !important;
+    padding: 0 !important;
+}
+
+.page-title-section {
+    padding-bottom: 2rem;
+}
+
+/* Fix for grid gaps in forms */
+.form-row-grid {
+    display: grid !important;
+    grid-template-columns: 1fr 1fr !important;
+    gap: 24px !important;
+    margin-bottom: 8px !important;
+}
+
+/* Photo Upload Styling */
+.photo-upload-container {
+    border: 2px dashed #e2e8f0 !important;
+    border-radius: 1.5rem !important;
+    padding: 2rem !important;
+    text-align: center !important;
+    transition: all 0.3s !important;
+    cursor: pointer !important;
+    background: #f8fafc !important;
+    height: 100% !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 1rem !important;
+    position: relative !important;
+}
+
+.photo-upload-container:hover,
+.photo-upload-container.dragover {
+    border-color: var(--brand) !important;
+    background: var(--brand-muted) !important;
+}
+
+.photo-preview {
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover !important;
+    border-radius: 1.5rem !important;
+    display: none;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+}
+
+.photo-upload-container i {
+    font-size: 2.5rem !important;
+    color: #94a3b8 !important;
+}
+
+#foto-input {
+    position: absolute !important;
+    width: 100% !important;
+    height: 100% !important;
+    top: 0 !important;
+    left: 0 !important;
+    opacity: 0 !important;
+    cursor: pointer !important;
+}
