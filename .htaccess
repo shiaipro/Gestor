@@ -1,0 +1,15 @@
+RewriteEngine On
+
+# Remove trailing slash
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)/$ /$1 [R=301,L]
+
+# Rota: /SLUG/inscricao → inscricao.php?slug=SLUG
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^([a-z0-9\-]+)/inscricao/?$ /inscricao.php?slug=$1 [QSA,L]
+
+# Rota: /SLUG/inscricao/TURMA-UUID → inscricao.php?slug=SLUG&t=UUID
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^([a-z0-9\-]+)/inscricao/([a-z0-9\-]+)/?$ /inscricao.php?slug=$1&t=$2 [QSA,L]
