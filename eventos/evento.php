@@ -406,6 +406,54 @@ if ($evento) {
       border: 1px solid #fecaca;
     }
 
+    .cpf-nao-encontrado {
+      margin-bottom: 16px;
+    }
+
+    .cpf-nao-encontrado__texto {
+      background: #fef2f2;
+      color: #b91c1c;
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      padding: 12px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+
+    .btn-inscrever-aluno {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      background: var(--brand-darker, #111);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 13px 14px;
+      font-size: 14px;
+      font-weight: 700;
+      text-decoration: none;
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      cursor: pointer;
+      transition: opacity .15s ease;
+    }
+
+    .btn-inscrever-aluno:hover {
+      opacity: .88;
+    }
+
+    .link-visitante {
+      display: block;
+      text-align: center;
+      margin-top: 12px;
+      font-size: 13px;
+      color: var(--gray-500);
+      text-decoration: underline;
+    }
+
     .evento-turmas {
       margin-bottom: 32px;
     }
@@ -996,6 +1044,7 @@ if ($evento) {
       var cpf = document.getElementById('cpfBusca').value;
       var msg = document.getElementById('cpfMsg');
       msg.style.display = 'none';
+      msg.className = 'form-alert form-alert--erro';
 
       var digits = cpf.replace(/\D/g, '');
       if (digits.length !== 11) {
@@ -1012,15 +1061,22 @@ if ($evento) {
         .then(function (r) { return r.json(); })
         .then(function (data) {
           if (!data.success) {
-            var texto = escapeHtml(data.message || 'Nenhum aluno encontrado.');
             if (data.nao_encontrado) {
-              if (data.link_cadastro) {
-                sessionStorage.setItem('shiaipro_cpf_evento', cpf);
-                texto += '<br><a href="' + escapeHtml(data.link_cadastro) + '" style="color:inherit; font-weight:800; text-decoration:underline;">Cadastrar novo aluno na unidade</a>';
-              }
-              texto += '<br><a href="#" onclick="mostrarVisitanteExame(\'' + cpf.replace(/'/g, '') + '\'); return false;" style="color:inherit; font-weight:800; text-decoration:underline;">Não sou aluno — inscrever apenas como visitante</a>';
+              var cpfLimpo = cpf.replace(/'/g, '');
+              var html = '<div class="cpf-nao-encontrado__texto"><i class="fa-solid fa-circle-exclamation"></i> ' +
+                escapeHtml(data.message || 'Nenhum aluno encontrado com esse CPF.') + '</div>' +
+                '<button type="button" class="btn-inscrever-aluno" onclick="mostrarVisitanteExame(\'' + cpfLimpo + '\')">' +
+                'Inscrever aluno' +
+                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7" /></svg>' +
+                '</button>';
+
+              msg.className = 'cpf-nao-encontrado';
+              msg.innerHTML = html;
+              msg.style.display = 'block';
+              return;
             }
-            msg.innerHTML = texto;
+            msg.className = 'form-alert form-alert--erro';
+            msg.textContent = data.message || 'Nenhum aluno encontrado.';
             msg.style.display = 'block';
             return;
           }
@@ -1146,6 +1202,15 @@ if ($evento) {
 
     function montarFormVisitanteExame(eventoId, cpfDigits) {
       var cpfFormatado = cpfDigits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4');
+
+      if (!TURMAS_VISITANTE_EXAME.length) {
+        return (
+          '<h3>Inscrição indisponível</h3>' +
+          '<div class="form-alert form-alert--erro">' +
+          '<i class="fa-solid fa-circle-exclamation"></i> Nenhuma turma deste exame está liberada para inscrição de visitante no momento. Entre em contato com a unidade organizadora.' +
+          '</div>'
+        );
+      }
 
       var opcoesTurma = TURMAS_VISITANTE_EXAME.map(function (t) {
         return '<option value="' + t.id + '">' + escapeHtml(t.nome) + '</option>';
