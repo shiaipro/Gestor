@@ -1,5 +1,5 @@
 <?php
-require_once '../config.php';
+require_once '../Gestor/config.php';
 
 $erro = '';
 
@@ -65,7 +65,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
-    <link rel="stylesheet" href="../assets/css/login.css?v=<?php echo time(); ?>">
+    <link rel="stylesheet" href="../Gestor/assets/css/login.css?v=<?php echo time(); ?>">
 </head>
 
 <body>
@@ -75,7 +75,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <div class="login-card">
         <div class="login-header">
             <a href="#" class="logo">
-                <img src="../assets/img/logo.png" alt="SHIAIPRO">
+                <img src="../Gestor/assets/img/logo.png" alt="SHIAIPRO">
             </a>
             <p>Área do Aluno / Responsável</p>
         </div>

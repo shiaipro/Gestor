@@ -1,5 +1,5 @@
 <?php
-require_once '../config.php';
+require_once '../Gestor/config.php';
 
 if (empty($_SESSION['portal_cpf'])) {
     header('Location: login.php');
@@ -43,8 +43,8 @@ $alunos = $stmt->fetchAll();
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-    <link rel="stylesheet" href="../assets/css/global.css?v=<?php echo time(); ?>">
-    <link rel="stylesheet" href="../assets/css/dashboard_v2.css?v=<?php echo time(); ?>">
+    <link rel="stylesheet" href="../Gestor/assets/css/global.css?v=<?php echo time(); ?>">
+    <link rel="stylesheet" href="../Gestor/assets/css/dashboard_v2.css?v=<?php echo time(); ?>">
 </head>
 
 <body>
@@ -52,7 +52,7 @@ $alunos = $stmt->fetchAll();
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; flex-wrap: wrap; gap: 20px;">
             <div style="display: flex; align-items: center; gap: 15px;">
-                <img src="../assets/img/logo.png" alt="SHIAIPRO" style="height: 36px;">
+                <img src="../Gestor/assets/img/logo.png" alt="SHIAIPRO" style="height: 36px;">
                 <h1 style="font-size: 1.1rem; font-weight: 900; text-transform: uppercase; margin: 0;">Área do Aluno</h1>
             </div>
             <a href="logout.php" class="btn-sq-outline" style="width: auto; padding: 10px 20px; font-size: var(--fs-sm);">
@@ -70,7 +70,7 @@ $alunos = $stmt->fetchAll();
                     <a href="ficha.php?id=<?php echo (int)$al['id']; ?>" class="dashboard-container" style="padding: 25px 30px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; text-decoration: none; color: inherit; cursor: pointer;">
                         <div style="width: 56px; height: 56px; border-radius: 50%; background: #133080; color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 1.1rem; flex-shrink: 0; overflow: hidden;">
                             <?php if (!empty($al['foto'])):
-                                $foto_base = '../uploads/u_' . (int)$al['unidade_id'];
+                                $foto_base = '../Gestor/uploads/u_' . (int)$al['unidade_id'];
                                 if (!empty($al['academia_id'])) { $foto_base .= '/academias/a_' . (int)$al['academia_id']; }
                                 $foto_url = $foto_base . '/alunos/' . $al['foto'];
                             ?>

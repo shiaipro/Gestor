@@ -1,5 +1,5 @@
 <?php
-require_once '../config.php';
+require_once '../Gestor/config.php';
 
 if (empty($_SESSION['portal_cpf'])) {
     header('Location: login.php');
@@ -33,7 +33,7 @@ if (!$aluno) {
 
 $foto_url = null;
 if (!empty($aluno['foto'])) {
-    $foto_url = '../uploads/u_' . (int)$aluno['unidade_id'];
+    $foto_url = '../Gestor/uploads/u_' . (int)$aluno['unidade_id'];
     if (!empty($aluno['academia_id'])) { $foto_url .= '/academias/a_' . (int)$aluno['academia_id']; }
     $foto_url .= '/alunos/' . $aluno['foto'];
 }
@@ -108,8 +108,8 @@ function campo($label, $valor) {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-    <link rel="stylesheet" href="../assets/css/global.css?v=<?php echo time(); ?>">
-    <link rel="stylesheet" href="../assets/css/dashboard_v2.css?v=<?php echo time(); ?>">
+    <link rel="stylesheet" href="../Gestor/assets/css/global.css?v=<?php echo time(); ?>">
+    <link rel="stylesheet" href="../Gestor/assets/css/dashboard_v2.css?v=<?php echo time(); ?>">
     <style>
         .tab-btn-inner.active {
             background: #133080 !important;
@@ -128,7 +128,7 @@ function campo($label, $valor) {
     <section class="dashboard-section-sq" style="max-width: 1180px; margin: 40px auto; padding: 0 20px;">
 
         <div style="text-align: center; margin-bottom: 25px;">
-            <img src="../assets/img/logo.png" alt="SHIAIPRO" style="height: 40px;">
+            <img src="../Gestor/assets/img/logo.png" alt="SHIAIPRO" style="height: 40px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; flex-wrap: wrap; gap: 20px;">
