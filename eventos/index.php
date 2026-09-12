@@ -4,6 +4,10 @@ require_once '../Gestor/config.php';
 // Busca eventos públicos cadastrados pelas unidades (academias) ativas do SHIAI PRO.
 $eventos = [];
 
+// Automigração: coluna de autorização de exibição pública do torneio (competicoes)
+$tem_publicar_site = $pdo->query("SHOW COLUMNS FROM competicoes LIKE 'publicar_site'")->fetch();
+$filtro_publicar_site = $tem_publicar_site ? "AND c.publicar_site = 1" : "";
+
 // 1. Exames de Faixa (graduações)
 $sql_grad = "SELECT eg.id, eg.titulo AS nome, eg.descricao, eg.data_evento AS data_evento, eg.horario, eg.local,
                     u.nome AS unidade_nome, u.cidade, u.estado
@@ -33,6 +37,7 @@ $sql_tor = "SELECT c.id, c.nome, c.data_evento, c.localizacao,
             FROM competicoes c
             JOIN unidades u ON u.id = c.unidade_id
             WHERE c.data_evento >= CURDATE() AND c.status = 'aberto' AND u.status = 'ativo'
+            $filtro_publicar_site
             ORDER BY c.data_evento ASC
             LIMIT 20";
 foreach ($pdo->query($sql_tor)->fetchAll() as $r) {
