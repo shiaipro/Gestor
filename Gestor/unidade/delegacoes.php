@@ -18,16 +18,39 @@ try {
         unidade_id INT NOT NULL,
         nome VARCHAR(255) NOT NULL,
         unidade_vinculada_id INT DEFAULT NULL,
+        email VARCHAR(255) DEFAULT NULL,
+        site VARCHAR(255) DEFAULT NULL,
+        whatsapp VARCHAR(30) DEFAULT NULL,
         cidade VARCHAR(100) DEFAULT NULL,
         estado VARCHAR(2) DEFAULT NULL,
+        pais VARCHAR(100) DEFAULT 'Brasil',
         responsavel_nome VARCHAR(255) DEFAULT NULL,
         responsavel_telefone VARCHAR(30) DEFAULT NULL,
         responsavel_email VARCHAR(255) DEFAULT NULL,
+        tecnico_nome VARCHAR(255) DEFAULT NULL,
+        tecnico_telefone VARCHAR(30) DEFAULT NULL,
+        financeiro_nome VARCHAR(255) DEFAULT NULL,
+        financeiro_telefone VARCHAR(30) DEFAULT NULL,
         criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (unidade_id) REFERENCES unidades(id) ON DELETE CASCADE,
         FOREIGN KEY (unidade_vinculada_id) REFERENCES unidades(id) ON DELETE SET NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
 }
+// Automigração: novos campos de contato completo da academia (email, site, whatsapp, país, técnico, financeiro)
+$col_check_deleg = $pdo->query("SHOW COLUMNS FROM delegacoes_visitantes LIKE 'email'")->fetch();
+if (!$col_check_deleg) {
+    $pdo->exec("ALTER TABLE delegacoes_visitantes
+        ADD COLUMN email VARCHAR(255) DEFAULT NULL AFTER unidade_vinculada_id,
+        ADD COLUMN site VARCHAR(255) DEFAULT NULL AFTER email,
+        ADD COLUMN whatsapp VARCHAR(30) DEFAULT NULL AFTER site,
+        ADD COLUMN pais VARCHAR(100) DEFAULT 'Brasil' AFTER estado,
+        ADD COLUMN tecnico_nome VARCHAR(255) DEFAULT NULL AFTER responsavel_email,
+        ADD COLUMN tecnico_telefone VARCHAR(30) DEFAULT NULL AFTER tecnico_nome,
+        ADD COLUMN financeiro_nome VARCHAR(255) DEFAULT NULL AFTER tecnico_telefone,
+        ADD COLUMN financeiro_telefone VARCHAR(30) DEFAULT NULL AFTER financeiro_nome
+    ");
+}
+
 try {
     $pdo->query("SELECT 1 FROM delegacoes_turmas LIMIT 1");
 } catch (Exception $e) {
@@ -79,6 +102,10 @@ include 'header.php';
             </a>
         </div>
     </div>
+
+    <?php if (($_GET['sucesso'] ?? '') === 'removida'): ?>
+        <div style="background:#dcfce7; color:#166534; padding:1rem 1.5rem; margin-bottom:20px;">Delegação removida com sucesso.</div>
+    <?php endif; ?>
 
     <div class="nav-tabs-sq" style="margin-bottom: 2rem;">
         <a href="eventos_dashboard.php" class="tab-item-sq">Dashboard</a>
@@ -136,10 +163,16 @@ include 'header.php';
                                     <?php else: ?>—<?php endif; ?>
                                 </td>
                                 <td style="padding: 18px 20px; font-size: var(--fs-sm);"><?php echo (int) $d['total_turmas']; ?></td>
-                                <td style="padding: 18px 20px; text-align: right;">
+                                <td style="padding: 18px 20px; text-align: right; white-space: nowrap;">
                                     <a href="editar_delegacao.php?id=<?php echo (int) $d['id']; ?>" class="btn-sq-light" style="width:auto; padding:8px 16px; font-size:var(--fs-xs);">
                                         <i class="fa-solid fa-pen" style="margin-right:6px;"></i> Gerenciar
                                     </a>
+                                    <form method="POST" action="editar_delegacao.php?id=<?php echo (int) $d['id']; ?>" style="display:inline;"
+                                        onsubmit="return confirm('Remover permanentemente esta academia/delegação? Ela também será removida dos convites de eventos e as turmas cadastradas serão apagadas.');">
+                                        <button type="submit" name="remover_delegacao" value="1" style="width:auto; padding:8px 12px; font-size:var(--fs-xs); background:#fee2e2; color:#991b1b; border:1px solid #fecaca; cursor:pointer; margin-left:6px;">
+                                            <i class="fa-solid fa-trash"></i>
+                                        </button>
+                                    </form>
                                 </td>
                             </tr>
                         <?php endforeach; ?>

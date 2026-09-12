@@ -102,12 +102,82 @@ try {
         ");
     }
 
+    // Automigração Tabela Competicoes (Publicação no site)
+    $column_check_publicar = $pdo->query("SHOW COLUMNS FROM competicoes LIKE 'publicar_site'")->fetch();
+    if (!$column_check_publicar) {
+        $pdo->exec("ALTER TABLE competicoes
+            ADD COLUMN publicar_site TINYINT(1) NOT NULL DEFAULT 1 AFTER status
+        ");
+        // Recarregar os dados após migração
+        $stmt_comp->execute([$id, $unidade_id]);
+        $comp = $stmt_comp->fetch();
+    }
+
+    // Automigração: cadastro de academias/delegações visitantes (reutilizável em vários eventos)
+    try {
+        $pdo->query("SELECT 1 FROM delegacoes_visitantes LIMIT 1");
+    } catch (Exception $e) {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS delegacoes_visitantes (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            unidade_id INT NOT NULL,
+            nome VARCHAR(255) NOT NULL,
+            unidade_vinculada_id INT DEFAULT NULL,
+            email VARCHAR(255) DEFAULT NULL,
+            site VARCHAR(255) DEFAULT NULL,
+            whatsapp VARCHAR(30) DEFAULT NULL,
+            cidade VARCHAR(100) DEFAULT NULL,
+            estado VARCHAR(2) DEFAULT NULL,
+            pais VARCHAR(100) DEFAULT 'Brasil',
+            responsavel_nome VARCHAR(255) DEFAULT NULL,
+            responsavel_telefone VARCHAR(30) DEFAULT NULL,
+            responsavel_email VARCHAR(255) DEFAULT NULL,
+            tecnico_nome VARCHAR(255) DEFAULT NULL,
+            tecnico_telefone VARCHAR(30) DEFAULT NULL,
+            financeiro_nome VARCHAR(255) DEFAULT NULL,
+            financeiro_telefone VARCHAR(30) DEFAULT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (unidade_id) REFERENCES unidades(id) ON DELETE CASCADE,
+            FOREIGN KEY (unidade_vinculada_id) REFERENCES unidades(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+    }
+
+    // Automigração: convidados (academias autorizadas a inscrever alunos) de cada competição
+    try {
+        $pdo->query("SELECT 1 FROM competicao_convidados LIMIT 1");
+    } catch (Exception $e) {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS competicao_convidados (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            competicao_id INT NOT NULL,
+            delegacao_id INT NOT NULL,
+            observacao VARCHAR(255) DEFAULT NULL,
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_competicao_delegacao (competicao_id, delegacao_id),
+            FOREIGN KEY (competicao_id) REFERENCES competicoes(id) ON DELETE CASCADE,
+            FOREIGN KEY (delegacao_id) REFERENCES delegacoes_visitantes(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+    }
+
     // Automigração Tabela Inscricoes (Pesagem)
     $column_check_pesagem = $pdo->query("SHOW COLUMNS FROM competicao_inscricoes LIKE 'pesagem_status'")->fetch();
     if (!$column_check_pesagem) {
-        $pdo->exec("ALTER TABLE competicao_inscricoes 
+        $pdo->exec("ALTER TABLE competicao_inscricoes
             ADD COLUMN peso_atleta DECIMAL(10,2) DEFAULT NULL AFTER status_pagamento,
             ADD COLUMN pesagem_status ENUM('pendente', 'aprovado', 'reprovado') DEFAULT 'pendente' AFTER peso_atleta
+        ");
+    }
+
+    // Automigração: novos campos de contato completo da academia (email, site, whatsapp, país, técnico, financeiro)
+    $col_check_deleg = $pdo->query("SHOW COLUMNS FROM delegacoes_visitantes LIKE 'email'")->fetch();
+    if (!$col_check_deleg) {
+        $pdo->exec("ALTER TABLE delegacoes_visitantes
+            ADD COLUMN email VARCHAR(255) DEFAULT NULL AFTER unidade_vinculada_id,
+            ADD COLUMN site VARCHAR(255) DEFAULT NULL AFTER email,
+            ADD COLUMN whatsapp VARCHAR(30) DEFAULT NULL AFTER site,
+            ADD COLUMN pais VARCHAR(100) DEFAULT 'Brasil' AFTER estado,
+            ADD COLUMN tecnico_nome VARCHAR(255) DEFAULT NULL AFTER responsavel_email,
+            ADD COLUMN tecnico_telefone VARCHAR(30) DEFAULT NULL AFTER tecnico_nome,
+            ADD COLUMN financeiro_nome VARCHAR(255) DEFAULT NULL AFTER tecnico_telefone,
+            ADD COLUMN financeiro_telefone VARCHAR(30) DEFAULT NULL AFTER financeiro_nome
         ");
     }
 } catch (Exception $e) {
@@ -160,6 +230,10 @@ include 'header.php';
     $mensagem = '';
     $erro = '';
 
+    if (($_GET['sucesso'] ?? '') === 'convidada') {
+        $mensagem = "Academia cadastrada e convidada com sucesso!";
+    }
+
     // Processar formulário
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // 1. Atualizar Dados da Competição
@@ -192,7 +266,7 @@ include 'header.php';
                         data_inicio_inscricoes = ?, data_fim_inscricoes = ?, hora_limite_inscricoes = ?,
                         localizacao = ?, mapa_embed = ?, video_embed = ?, fotos = ?, 
                         regras = ?, lgpd = ?,
-                        status = ? 
+                        status = ?, publicar_site = ?
                         WHERE id = ?";
 
                 $stmt = $pdo->prepare($sql);
@@ -215,6 +289,7 @@ include 'header.php';
                     $_POST['regras'],
                     $_POST['lgpd'],
                     $_POST['status'],
+                    isset($_POST['publicar_site']) ? 1 : 0,
                     $id
                 ]);
 
@@ -355,6 +430,28 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         if (isset($_POST['remover_inscricao'])) {
             $pdo->prepare("DELETE FROM competicao_inscricoes WHERE id = ?")->execute([$_POST['insc_id']]);
             $mensagem = "Inscrição removida!";
+        }
+
+        // 6b. Academias Convidadas
+        if (isset($_POST['adicionar_convidado'])) {
+            try {
+                $delegacao_id = (int) ($_POST['delegacao_id'] ?? 0);
+                if (!$delegacao_id) {
+                    throw new Exception("Selecione uma academia para convidar.");
+                }
+
+                $stmt = $pdo->prepare("INSERT IGNORE INTO competicao_convidados (competicao_id, delegacao_id) VALUES (?, ?)");
+                $stmt->execute([$id, $delegacao_id]);
+                $mensagem = "Academia convidada com sucesso!";
+            } catch (Exception $e) {
+                $erro = "Erro ao convidar academia: " . $e->getMessage();
+            }
+        }
+
+        if (isset($_POST['remover_convidado'])) {
+            $pdo->prepare("DELETE FROM competicao_convidados WHERE id = ? AND competicao_id = ?")
+                ->execute([$_POST['convidado_id'], $id]);
+            $mensagem = "Convite removido!";
         }
 
         // 7. Gerar Chaves (Brackets)
@@ -522,6 +619,21 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
     $todos_alunos->execute([$unidade_id]);
     $todos_alunos = $todos_alunos->fetchAll();
 
+    // Academias Convidadas
+    $convidados = $pdo->prepare("SELECT cc.id, cc.observacao, d.id AS delegacao_id, d.nome, d.cidade, d.estado
+            FROM competicao_convidados cc
+            JOIN delegacoes_visitantes d ON d.id = cc.delegacao_id
+            WHERE cc.competicao_id = ?
+            ORDER BY d.nome ASC");
+    $convidados->execute([$id]);
+    $convidados = $convidados->fetchAll();
+
+    $delegacoes_disponiveis = $pdo->prepare("SELECT id, nome FROM delegacoes_visitantes
+            WHERE unidade_id = ? AND id NOT IN (SELECT delegacao_id FROM competicao_convidados WHERE competicao_id = ?)
+            ORDER BY nome ASC");
+    $delegacoes_disponiveis->execute([$unidade_id, $id]);
+    $delegacoes_disponiveis = $delegacoes_disponiveis->fetchAll();
+
     // Totais Financeiros
     $total_receita = 0;
     $total_despesa = 0;
@@ -544,12 +656,15 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
             background: #e2e8f0;
             padding: 2px;
             margin-bottom: 30px;
-            width: fit-content;
+            width: 100%;
+            max-width: 100%;
             border-radius: 0;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
         }
 
         .tab-btn {
-            padding: 12px 25px;
+            padding: 12px 20px;
             background: #f1f5f9;
             color: var(--text-muted);
             text-decoration: none;
@@ -562,6 +677,8 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
             display: flex;
             align-items: center;
             gap: 8px;
+            white-space: nowrap;
+            flex: 0 0 auto;
         }
 
         .tab-btn:hover {
@@ -1092,6 +1209,20 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                         </select>
                                     </div>
                                 </div>
+                                <div class="form-group" style="margin-top: 1rem;">
+                                    <label
+                                        style="display: flex; align-items: center; gap: 0.6rem; cursor: pointer; font-size: 0.85rem; font-weight: 700; color: var(--text);">
+                                        <input type="checkbox" name="publicar_site" value="1"
+                                            style="width: 18px; height: 18px; cursor: pointer;"
+                                            <?php echo (($comp['publicar_site'] ?? 1) == 1) ? 'checked' : ''; ?>>
+                                        Exibir este evento em shiaipro.com.br/eventos
+                                    </label>
+                                    <span
+                                        style="font-size: 0.7rem; color: var(--text-muted); margin-left: 1.9rem; display: block;">
+                                        Desmarque para manter o evento visível apenas internamente, sem publicá-lo na
+                                        listagem pública do site.
+                                    </span>
+                                </div>
                             </section>
 
                             <!-- Bloco 6: Regras e LGPD -->
@@ -1128,16 +1259,93 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
 
                 </form>
 
-                <!-- Footer Fixo do Form -->
+                <!-- Bloco: Academias Convidadas -->
+                <section style="margin-top: 2rem;">
+                    <h4
+                        style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1.5rem; color: var(--danger); font-size: 0.9rem; text-transform: uppercase; font-weight: 800;">
+                        <i class="fa-solid fa-people-group"></i> Academias Convidadas
+                    </h4>
+                    <p style="color: var(--text-muted); font-size: 0.8rem; margin: -1rem 0 1.25rem 0;">
+                        Cadastre as academias autorizadas a inscrever seus alunos neste evento. A lista é reaproveitada
+                        do seu cadastro de <a href="delegacoes.php" target="_blank">Delegações Visitantes</a>.
+                    </p>
+                    <div
+                        style="background: #f8fafc; border: 1px solid var(--border); padding: 1.25rem; border-radius: 0;">
+                        <form method="POST" action="editar_competicao.php?id=<?php echo $id; ?>&tab=info"
+                            style="display: flex; flex-wrap: wrap; align-items: flex-end; gap: 1rem; margin-bottom: 1.5rem;">
+                            <div class="form-group" style="flex: 1; min-width: 220px;">
+                                <label
+                                    style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase; font-weight: 800;">Academia</label>
+                                <select name="delegacao_id" id="convidado_delegacao_id" class="form-control">
+                                    <option value="">Selecione...</option>
+                                    <?php foreach ($delegacoes_disponiveis as $d): ?>
+                                        <option value="<?php echo (int) $d['id']; ?>"><?php echo htmlspecialchars($d['nome']); ?></option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <button type="submit" name="adicionar_convidado" value="1" class="btn-sq"
+                                style="width: auto; padding: 0.85rem 1.75rem; font-weight: 800;">
+                                <i class="fa-solid fa-plus"></i> Convidar
+                            </button>
+                            <a href="nova_delegacao.php?evento_id=<?php echo $id; ?>" class="btn-sq-light"
+                                style="width: auto; padding: 0.85rem 1.75rem; font-weight: 800; white-space: nowrap;">
+                                <i class="fa-solid fa-circle-plus"></i> Cadastrar Nova Academia
+                            </a>
+                        </form>
+
+                        <?php if (empty($convidados)): ?>
+                            <div style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                                Nenhuma academia convidada até o momento.
+                            </div>
+                        <?php else: ?>
+                            <div style="overflow-x: auto;">
+                                <table style="width:100%; border-collapse: collapse;">
+                                    <thead>
+                                        <tr style="text-align:left; border-bottom: 1px solid var(--border);">
+                                            <th style="padding: 10px; font-size: var(--fs-xs); color: var(--text-muted); text-transform: uppercase;">Academia</th>
+                                            <th style="padding: 10px; font-size: var(--fs-xs); color: var(--text-muted); text-transform: uppercase;">Cidade</th>
+                                            <th style="padding: 10px; font-size: var(--fs-xs); color: var(--text-muted); text-transform: uppercase; text-align:right;">Ações</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        <?php foreach ($convidados as $c): ?>
+                                            <tr style="border-bottom: 1px solid var(--border);">
+                                                <td style="padding: 10px; font-weight: 700;"><?php echo htmlspecialchars($c['nome']); ?></td>
+                                                <td style="padding: 10px;"><?php echo htmlspecialchars(trim(($c['cidade'] ?: '') . ($c['estado'] ? ' - ' . $c['estado'] : '')) ?: '—'); ?></td>
+                                                <td style="padding: 10px; text-align:right; white-space: nowrap;">
+                                                    <a href="editar_delegacao.php?id=<?php echo (int) $c['delegacao_id']; ?>" class="btn-sq-light"
+                                                        style="width:auto; padding: 6px 12px; font-size: var(--fs-xs); display: inline-block;">
+                                                        <i class="fa-solid fa-pen"></i>
+                                                    </a>
+                                                    <form method="POST" action="editar_competicao.php?id=<?php echo $id; ?>&tab=info"
+                                                        style="display:inline;"
+                                                        onsubmit="return confirm('Remover o convite desta academia?');">
+                                                        <input type="hidden" name="convidado_id" value="<?php echo (int) $c['id']; ?>">
+                                                        <button type="submit" name="remover_convidado" value="1" class="btn-sq-light"
+                                                            style="width:auto; padding: 6px 12px; font-size: var(--fs-xs);">
+                                                            <i class="fa-solid fa-trash"></i>
+                                                        </button>
+                                                    </form>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                </section>
+
+                <!-- Footer do Form -->
                 <div
-                    style="position: absolute; bottom: 0; left: 0; right: 0; background: rgba(255,255,255,0.98); backdrop-filter: blur(10px);  padding: 1.25rem 2rem; display: flex; justify-content: space-between; align-items: center; z-index: 100; border-radius: 0;">
+                    style="position: sticky; bottom: 0; background: rgba(255,255,255,0.98); backdrop-filter: blur(10px); padding: 1.25rem 2rem; margin-top: 1.5rem; display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 1rem 1.5rem; z-index: 100; border-radius: 0; border-top: 1px solid var(--border);">
                     <p
-                        style="color: var(--text-muted); font-size: 0.8rem; margin:0; display: flex; align-items: center; gap: 0.5rem;">
+                        style="color: var(--text-muted); font-size: 0.8rem; margin: 0 auto 0 0; display: flex; align-items: center; gap: 0.5rem;">
                         <i class="fa-solid fa-circle-info" style="color: #08153a;"></i>
                         Verifique as informações antes de salvar o evento.
                     </p>
                     <button type="submit" form="form-ajustes-evento" class="btn-sq"
-                        style="padding: 0.85rem 3rem; font-weight: 800; font-size: 1rem; border-radius: 0; box-shadow: 0 4px 15px rgba(var(--primary-rgb), 0.3); display: flex; align-items: center; gap: 0.75rem;">
+                        style="padding: 0.85rem 3rem; font-weight: 800; font-size: 1rem; border-radius: 0; box-shadow: 0 4px 15px rgba(var(--primary-rgb), 0.3); display: flex; align-items: center; justify-content: center; gap: 0.75rem; white-space: nowrap; flex: 0 0 auto;">
                         <i class="fa-solid fa-cloud-arrow-up"></i>
                         ATUALIZAR COMPETIÇÃO
                     </button>
@@ -1278,8 +1486,18 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                             <div class="form-group"><label
                                     style="color:var(--text-muted); font-size:0.75rem; text-transform:uppercase;">Equipe/Academia</label><input
                                     type="text" name="equipe_ext" id="field_equipe_ext" class="form-control"
-                                    placeholder="Ex: Gracie Barra"
+                                    list="lista_convidados" placeholder="Ex: Gracie Barra"
                                     style="background:#fff; border:1px solid var(--border);">
+                                <datalist id="lista_convidados">
+                                    <?php foreach ($convidados as $c): ?>
+                                        <option value="<?php echo htmlspecialchars($c['nome']); ?>">
+                                    <?php endforeach; ?>
+                                </datalist>
+                                <?php if (!empty($convidados)): ?>
+                                    <span style="font-size: 0.65rem; color: var(--text-muted); display: block; margin-top: 4px;">
+                                        Sugestões da lista de <a href="?id=<?php echo $id; ?>&tab=info" style="color: var(--primary-green);">Academias Convidadas</a>.
+                                    </span>
+                                <?php endif; ?>
                             </div>
                             <div class="form-group"><label
                                     style="color:var(--text-muted); font-size:0.75rem; text-transform:uppercase;">Faixa</label><input
