@@ -23,7 +23,7 @@ $configs = [
     ],
     'torneio' => [
         'tabela'    => 'competicoes',
-        'sql'       => "SELECT c.id, c.nome, c.data_evento, c.localizacao,
+        'sql'       => "SELECT c.id, c.nome, c.descricao, c.data_evento, c.localizacao, c.fotos,
                                 u.id AS unidade_id, u.nome AS unidade_nome, u.cidade, u.estado
                          FROM competicoes c
                          JOIN unidades u ON u.id = c.unidade_id
@@ -79,13 +79,100 @@ if ($evento) {
         $local = trim(($evento['cidade'] ?? '') . ($evento['estado'] ? ' - ' . $evento['estado'] : ''));
     }
 
-    $descricao = ($tipo === 'exame' && !empty($evento['descricao']))
+    $descricao = (in_array($tipo, ['exame', 'torneio'], true) && trim((string) ($evento['descricao'] ?? '')) !== '')
         ? $evento['descricao']
         : (($tipo === 'oficial' && !empty($evento['organizacao']))
             ? ('Competição oficial organizada por ' . $evento['organizacao'] . '.')
             : $cfg['desc_pad']);
 
     $titulo = $evento['nome'];
+
+    // Torneio: usa a primeira foto cadastrada em Ajustes (editar_competicao.php) como capa do banner
+    $banner_url = null;
+    if ($tipo === 'torneio') {
+        $fotos_evt = json_decode($evento['fotos'] ?? '[]', true);
+        if (is_array($fotos_evt) && !empty($fotos_evt[0])) {
+            $banner_url = '../Gestor/uploads/competicoes/' . rawurlencode(basename($fotos_evt[0]));
+        }
+    }
+
+    // ── Torneio: delegações visitantes convidadas + categorias configuradas ──
+    // (só faz sentido perguntar isso quando o CPF não pertence a nenhum aluno cadastrado)
+    $delegacoes_torneio = [];
+    $categorias_torneio = [];
+    $turmas_torneio = [];
+    if ($tipo === 'torneio') {
+        $stmt_deleg = $pdo->prepare(
+            "SELECT dv.id, dv.nome
+             FROM competicao_convidados cc
+             JOIN delegacoes_visitantes dv ON dv.id = cc.delegacao_id
+             WHERE cc.competicao_id = ?
+             ORDER BY dv.nome ASC"
+        );
+        try {
+            $stmt_deleg->execute([$evento['id']]);
+            $delegacoes_torneio = $stmt_deleg->fetchAll();
+        } catch (PDOException $e) {
+            $delegacoes_torneio = [];
+        }
+
+        // Turmas / equipes / professores cadastrados em cada delegação convidada
+        // (Gestor > Delegações > editar). Alimentam o campo "Turma / Professor" do visitante.
+        $turmas_delegacoes = [];
+        if ($delegacoes_torneio) {
+            $ids_deleg = array_map('intval', array_column($delegacoes_torneio, 'id'));
+            $marcadores = implode(',', array_fill(0, count($ids_deleg), '?'));
+            try {
+                $stmt_td = $pdo->prepare("SELECT id, delegacao_id, nome FROM delegacoes_turmas WHERE delegacao_id IN ($marcadores) ORDER BY nome ASC");
+                $stmt_td->execute($ids_deleg);
+                foreach ($stmt_td->fetchAll() as $td) {
+                    $turmas_delegacoes[(int) $td['delegacao_id']][] = ['id' => (int) $td['id'], 'nome' => $td['nome']];
+                }
+            } catch (PDOException $e) {
+                $turmas_delegacoes = [];
+            }
+        }
+
+        $stmt_cat = $pdo->prepare("SELECT cc.id, cc.nome, cc.sexo, cc.ano_nascimento_min, cc.ano_nascimento_max, cc.limite_atletas, cc.faixas, cc.peso_max,
+                (SELECT COUNT(*) FROM competicao_inscricoes ci WHERE ci.categoria_id = cc.id AND ci.status_pagamento = 'pago') as total_pagos
+             FROM competicao_categorias cc WHERE cc.competicao_id = ?");
+        try {
+            $stmt_cat->execute([$evento['id']]);
+            $categorias_torneio = $stmt_cat->fetchAll();
+            usort($categorias_torneio, function ($a, $b) {
+                return strnatcasecmp($a['nome'], $b['nome']);
+            });
+        } catch (PDOException $e) {
+            $categorias_torneio = [];
+        }
+
+        // Faixas/graduações da unidade (Configurações > Faixas e Graduações) — o inscrito escolhe a dele
+        $faixas_unidade = [];
+        try {
+            // Só o nome da faixa (o "grau" cadastrado é um número de ordem, não interessa ao inscrito)
+            $stmt_grads = $pdo->prepare("SELECT nome FROM unidade_graduacoes WHERE unidade_id = ? ORDER BY ordem ASC, nome ASC");
+            $stmt_grads->execute([$evento['unidade_id']]);
+            foreach ($stmt_grads->fetchAll() as $g) {
+                $nome_faixa = trim($g['nome']);
+                if ($nome_faixa !== '' && !in_array($nome_faixa, $faixas_unidade, true)) {
+                    $faixas_unidade[] = $nome_faixa;
+                }
+            }
+        } catch (PDOException $e) {
+            $faixas_unidade = [];
+        }
+        if (!$faixas_unidade) {
+            $faixas_unidade = ['Branca', 'Cinza', 'Amarela', 'Laranja', 'Verde', 'Azul', 'Roxa', 'Marrom', 'Preta'];
+        }
+
+        $stmt_turmas_torneio = $pdo->prepare("SELECT id, nome, horario FROM turmas WHERE unidade_id = ? AND status = 'ativo' ORDER BY nome ASC");
+        try {
+            $stmt_turmas_torneio->execute([$evento['unidade_id']]);
+            $turmas_torneio = $stmt_turmas_torneio->fetchAll();
+        } catch (PDOException $e) {
+            $turmas_torneio = [];
+        }
+    }
 
     $ok  = isset($_GET['ok']);
     $erro = isset($_GET['erro']);
@@ -249,6 +336,20 @@ if ($evento) {
     .evento-detalhe__banner i {
       font-size: 110px;
       color: rgba(255, 255, 255, .18);
+    }
+
+    .evento-detalhe__banner--foto {
+      height: auto;
+      min-height: 220px;
+      max-height: 420px;
+      background: var(--gray-100, #f1f5f9);
+    }
+
+    .evento-detalhe__banner--foto img {
+      width: 100%;
+      max-height: 420px;
+      object-fit: cover;
+      display: block;
     }
 
     .evento-detalhe__banner .data-badge {
@@ -675,14 +776,14 @@ if ($evento) {
   <!-- HEADER -->
   <header class="header" id="header">
     <div class="container header__inner">
-      <a href="../Tema/index.html" class="logo">
+      <a href="/index.html" class="logo">
         <img src="../Gestor/assets/img/logotipos/10.png" alt="SHIAIPRO Logo" style="height: 40px; width: auto;">
       </a>
       <nav class="nav" id="nav">
-        <a href="../Tema/index.html#features" class="nav__link">Funcionalidades</a>
-        <a href="../Tema/index.html#plans" class="nav__link">Planos</a>
+        <a href="/index.html#features" class="nav__link">Funcionalidades</a>
+        <a href="/index.html#plans" class="nav__link">Planos</a>
         <a href="index.php" class="nav__link">Eventos</a>
-        <a href="../Tema/index.html#faq" class="nav__link">FAQ</a>
+        <a href="/index.html#faq" class="nav__link">FAQ</a>
       </nav>
       <div class="header__actions">
         <a href="/Gestor" class="btn btn--dark-outline" target="_blank">Entrar</a>
@@ -724,17 +825,17 @@ if ($evento) {
         <div class="evento-detalhe__grid">
 
           <div class="evento-detalhe__col">
-            <div class="evento-detalhe__banner">
+            <div class="evento-detalhe__banner<?php echo $banner_url ? ' evento-detalhe__banner--foto' : ''; ?>">
+              <?php if ($banner_url): ?>
+                <img src="<?php echo htmlspecialchars($banner_url); ?>" alt="<?php echo htmlspecialchars($titulo); ?>">
+              <?php endif; ?>
               <div class="data-badge">
                 <strong><?php echo htmlspecialchars($dia); ?></strong>
                 <span><?php echo htmlspecialchars($mes); ?></span>
               </div>
-              <i class="fa-solid <?php echo htmlspecialchars($cfg['icone']); ?>"></i>
-            </div>
-
-            <div class="evento-detalhe__desc">
-              <h2>Sobre o evento</h2>
-              <p><?php echo nl2br(htmlspecialchars($descricao)); ?></p>
+              <?php if (!$banner_url): ?>
+                <i class="fa-solid <?php echo htmlspecialchars($cfg['icone']); ?>"></i>
+              <?php endif; ?>
             </div>
 
             <div class="evento-meta-list">
@@ -817,6 +918,11 @@ if ($evento) {
               <?php endif; ?>
             </div>
 
+            <div class="evento-detalhe__desc">
+              <h2>Sobre o evento</h2>
+              <p><?php echo nl2br(htmlspecialchars($descricao)); ?></p>
+            </div>
+
             <?php if ($tipo === 'exame' && empty($evento['todas_turmas']) && !empty($turmas_evento)): ?>
               <div class="evento-turmas">
                 <h2>Turmas e valores</h2>
@@ -868,9 +974,26 @@ if ($evento) {
               </div>
             <?php elseif (isset($_GET['ja_inscrito'])): ?>
               <div class="form-alert form-alert--erro">
-                <i class="fa-solid fa-circle-exclamation"></i> Esse CPF já está inscrito neste evento.
+                <i class="fa-solid fa-circle-exclamation"></i> Este atleta já está inscrito neste evento com esse CPF de responsável.
+              </div>
+            <?php elseif (isset($_GET['categoria_lotada'])): ?>
+              <div class="form-alert form-alert--erro">
+                <i class="fa-solid fa-circle-exclamation"></i> Essa categoria já atingiu o limite de atletas inscritos.
               </div>
             <?php endif; ?>
+            <script>
+              // A mensagem acima vem de parâmetros na URL (?ok=1, ?erro=1...). Remove-os logo depois
+              // de exibir, para que atualizar a página não repita a mensagem de uma inscrição anterior.
+              (function () {
+                if (!window.history || !history.replaceState) return;
+                var url = new URL(window.location.href);
+                var tinha = false;
+                ['ok', 'erro', 'ja_inscrito', 'categoria_lotada'].forEach(function (p) {
+                  if (url.searchParams.has(p)) { url.searchParams.delete(p); tinha = true; }
+                });
+                if (tinha) history.replaceState(null, '', url.pathname + url.search + url.hash);
+              })();
+            </script>
 
             <?php if ($tipo === 'exame'): ?>
 
@@ -881,8 +1004,8 @@ if ($evento) {
                   <h3>Inscreva-se neste exame</h3>
                   <p class="sub">Digite o CPF do responsável (ou do próprio aluno) para localizar os alunos vinculados.</p>
                   <div class="form-group">
-                    <label for="cpfBusca">CPF</label>
-                    <input type="text" id="cpfBusca" placeholder="000.000.000-00" inputmode="numeric" maxlength="14">
+                    <label for="cpfBusca">CPF do responsável</label>
+                    <input type="text" id="cpfBusca" placeholder="000.000.000-00" inputmode="numeric" maxlength="14" autocomplete="off">
                   </div>
                   <div id="cpfMsg" class="form-alert form-alert--erro" style="display:none;"></div>
                   <button type="button" class="btn btn--dark btn--lg" onclick="buscarCpf()">
@@ -938,10 +1061,10 @@ if ($evento) {
 
                 <div id="passoVisitanteCpf">
                   <h3>Inscreva-se neste evento</h3>
-                  <p class="sub">Digite seu CPF para começar. Esse cadastro vale apenas para este evento.</p>
+                  <p class="sub">Digite o CPF do responsável (ou do próprio aluno) para começar. Esse cadastro vale apenas para este evento.</p>
                   <div class="form-group">
-                    <label for="cpfVisitante">CPF</label>
-                    <input type="text" id="cpfVisitante" placeholder="000.000.000-00" inputmode="numeric" maxlength="14">
+                    <label for="cpfVisitante">CPF do responsável</label>
+                    <input type="text" id="cpfVisitante" placeholder="000.000.000-00" inputmode="numeric" maxlength="14" autocomplete="off">
                   </div>
                   <div id="cpfVisitanteMsg" class="form-alert form-alert--erro" style="display:none;"></div>
                   <button type="button" class="btn btn--dark btn--lg" onclick="verificarCpfVisitante()">
@@ -969,7 +1092,7 @@ if ($evento) {
     <div class="container footer__inner">
       <div class="footer__top">
         <div class="footer__brand">
-          <a href="../Tema/index.html" class="logo logo--light">
+          <a href="/index.html" class="logo logo--light">
             <img src="https://shiaipro.com.br/Gestor/assets/img/logotipos/10.png" alt="SHIAIPRO Logo"
               style="height: 40px; width: auto;">
           </a>
@@ -978,8 +1101,8 @@ if ($evento) {
         <div class="footer__cols">
           <div class="footer__col">
             <h4>Produto</h4>
-            <a href="../Tema/produto.html#funcionalidades">Funcionalidades</a>
-            <a href="../Tema/produto.html#precos">Preços</a>
+            <a href="/produto.html#funcionalidades">Funcionalidades</a>
+            <a href="/produto.html#precos">Preços</a>
           </div>
           <div class="footer__col">
             <h4>Recursos</h4>
@@ -987,13 +1110,13 @@ if ($evento) {
           </div>
           <div class="footer__col">
             <h4>Empresa</h4>
-            <a href="../Tema/sobre-nos.html#sobre">Sobre nós</a>
-            <a href="../Tema/sobre-nos.html#contato">Contato</a>
+            <a href="/sobre-nos.html#sobre">Sobre nós</a>
+            <a href="/sobre-nos.html#contato">Contato</a>
           </div>
           <div class="footer__col">
             <h4>Legal</h4>
-            <a href="../Tema/legal.html#termos">Termos de Uso</a>
-            <a href="../Tema/legal.html#privacidade">Privacidade</a>
+            <a href="/legal.html#termos">Termos de Uso</a>
+            <a href="/legal.html#privacidade">Privacidade</a>
           </div>
         </div>
       </div>
@@ -1005,7 +1128,6 @@ if ($evento) {
   </footer>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
-  <script src="../Tema/js/components.js"></script>
   <script src="../Tema/js/main.js"></script>
 
   <script>
@@ -1047,8 +1169,8 @@ if ($evento) {
       msg.className = 'form-alert form-alert--erro';
 
       var digits = cpf.replace(/\D/g, '');
-      if (digits.length !== 11) {
-        msg.textContent = 'Digite um CPF válido.';
+      if (!cpfValido(digits)) {
+        msg.textContent = digits.length !== 11 ? 'Digite os 11 números do CPF.' : 'CPF inválido. Confira os números digitados.';
         msg.style.display = 'block';
         return;
       }
@@ -1087,6 +1209,17 @@ if ($evento) {
           msg.textContent = 'Erro ao buscar. Tente novamente.';
           msg.style.display = 'block';
         });
+    }
+
+    // Valida o CPF pelos dígitos verificadores (mesma regra de inc_cpf.php)
+    function cpfValido(digits) {
+      if (!/^\d{11}$/.test(digits) || /^(\d)\1{10}$/.test(digits)) return false;
+      for (var t = 9; t < 11; t++) {
+        var soma = 0;
+        for (var i = 0; i < t; i++) soma += parseInt(digits.charAt(i), 10) * ((t + 1) - i);
+        if (parseInt(digits.charAt(t), 10) !== ((10 * soma) % 11) % 10) return false;
+      }
+      return true;
     }
 
     function escapeHtml(str) {
@@ -1162,32 +1295,218 @@ if ($evento) {
 
     // ── Visitante (inscrição válida só para o evento escolhido, não vira aluno da unidade) ──
 
+    var DELEGACOES_TORNEIO = <?php echo json_encode(array_map(function ($d) {
+        return ['id' => (int) $d['id'], 'nome' => $d['nome']];
+    }, $delegacoes_torneio ?? [])); ?>;
+    var CATEGORIAS_TORNEIO = <?php echo json_encode(array_map(function ($c) {
+        $vagas = $c['limite_atletas'] ? max(0, (int) $c['limite_atletas'] - (int) $c['total_pagos']) : null;
+        $sexo_labels = ['masculino' => 'Masc', 'feminino' => 'Fem', 'unissex' => 'Masc/Fem'];
+        return [
+            'id' => (int) $c['id'],
+            'nome' => $c['nome'],
+            'sexo' => $sexo_labels[$c['sexo']] ?? $c['sexo'],
+            'ano_min' => $c['ano_nascimento_min'],
+            'ano_max' => $c['ano_nascimento_max'],
+            'vagas' => $vagas,
+            'faixas' => trim((string) ($c['faixas'] ?? '')),
+            'peso_max' => $c['peso_max'] !== null && $c['peso_max'] !== '' ? (float) $c['peso_max'] : null,
+        ];
+    }, $categorias_torneio ?? [])); ?>;
+    var FAIXAS_UNIDADE = <?php echo json_encode(array_values($faixas_unidade ?? [])); ?>;
+    var TURMAS_DELEGACOES = <?php echo json_encode((object) ($turmas_delegacoes ?? [])); ?>;
+    var TURMAS_TORNEIO = <?php echo json_encode(array_map(function ($t) {
+        return ['id' => (int) $t['id'], 'nome' => $t['nome'] . ($t['horario'] ? ' - ' . substr($t['horario'], 0, 5) : '')];
+    }, $turmas_torneio ?? [])); ?>;
+
+    // ── Categoria em cascata: 1) categoria (nome/sexo/anos + vagas) → 2) faixa → 3) peso ──
+    // Cada linha de competicao_categorias é uma combinação nome+sexo+anos+faixa+peso; o select
+    // final (#visCategoria / #torCategoria) recebe o id dessa linha, como antes.
+    function grupoCategoriaKey(c) {
+      return [c.nome, c.sexo, c.ano_min || '', c.ano_max || ''].join('|');
+    }
+    function somaVagas(lista) {
+      if (lista.some(function (c) { return c.vagas === null; })) return null; // alguma sem limite
+      return lista.reduce(function (t, c) { return t + c.vagas; }, 0);
+    }
+    function textoVagas(v) {
+      if (v === null) return '';
+      return v > 0 ? v + (v === 1 ? ' vaga disponível' : ' vagas disponíveis') : 'Esgotada';
+    }
+    // A categoria aceita a faixa do atleta? (faixas vazia/"livre" aceita todas; senão compara pelo nome da cor)
+    function categoriaAceitaFaixa(c, faixaAtleta) {
+      var f = (c.faixas || '').toLowerCase();
+      if (!f || f.indexOf('livre') !== -1 || f.indexOf('todas') !== -1) return true;
+      var cor = String(faixaAtleta || '').split(' - ')[0].trim().toLowerCase();
+      return cor !== '' && f.indexOf(cor) !== -1;
+    }
+    function labelPesoCat(c) {
+      return c.peso_max ? 'Até ' + String(c.peso_max).replace('.', ',') + ' kg' : 'Peso livre';
+    }
+    function opcoesSelect(itens, placeholder) {
+      return '<option value="">' + placeholder + '</option>' + itens.map(function (it) {
+        return '<option value="' + escapeHtml(String(it.valor)) + '"' + (it.desabilitado ? ' disabled' : '') + '>' + escapeHtml(it.texto) + '</option>';
+      }).join('');
+    }
+    function selecionarUnicaOpcao(sel) {
+      var validas = Array.prototype.filter.call(sel.options, function (o) { return o.value && !o.disabled; });
+      if (validas.length === 1) {
+        sel.value = validas[0].value;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    }
+
+    // Monta os 3 selects. prefixo 'vis' (visitante) ou 'tor' (aluno); nomeFinal = atributo name do select final.
+    function htmlCategoriaCascata(prefixo, nomeFinal, nomeFaixa, faixaAtual) {
+      if (!CATEGORIAS_TORNEIO.length) return '';
+      var grupos = {};
+      var ordem = [];
+      CATEGORIAS_TORNEIO.forEach(function (c) {
+        var k = grupoCategoriaKey(c);
+        if (!grupos[k]) { grupos[k] = []; ordem.push(k); }
+        grupos[k].push(c);
+      });
+      var itens = ordem.map(function (k) {
+        var base = grupos[k][0];
+        var partes = [base.nome];
+        if (base.sexo) partes.push(base.sexo);
+        if (base.ano_min && base.ano_max) partes.push(base.ano_min + ' a ' + base.ano_max);
+        else if (base.ano_min || base.ano_max) partes.push(base.ano_min || base.ano_max);
+        var v = somaVagas(grupos[k]);
+        if (v !== null) partes.push(textoVagas(v));
+        return { valor: k, texto: partes.join(' - '), desabilitado: v === 0 };
+      });
+      return '<div class="form-group"><label for="' + prefixo + 'CatGrupo">Categoria do atleta</label>' +
+          '<select id="' + prefixo + 'CatGrupo" data-cascata="' + prefixo + '" required>' + opcoesSelect(itens, 'Selecione a categoria do atleta') + '</select></div>' +
+        '<div class="form-group" id="' + prefixo + 'CatFaixaGrupo" style="display:none;"><label for="' + prefixo + 'CatFaixa">Faixa do atleta</label>' +
+          '<select id="' + prefixo + 'CatFaixa" data-cascata="' + prefixo + '"' + (nomeFaixa ? ' name="' + nomeFaixa + '"' : '') +
+          ' data-faixa-atual="' + escapeHtml(faixaAtual || '') + '"></select></div>' +
+        '<div class="form-group" id="' + prefixo + 'CategoriaGrupo" style="display:none;"><label for="' + prefixo + 'Categoria">Peso do atleta</label>' +
+          '<select id="' + prefixo + 'Categoria"' + (nomeFinal ? ' name="' + nomeFinal + '"' : '') + ' required></select></div>';
+    }
+
+    document.addEventListener('change', function (ev) {
+      var alvo = ev.target;
+      var prefixo = alvo && alvo.getAttribute && alvo.getAttribute('data-cascata');
+      if (!prefixo) return;
+      var selGrupo = document.getElementById(prefixo + 'CatGrupo');
+      var selFaixa = document.getElementById(prefixo + 'CatFaixa');
+      var selPeso = document.getElementById(prefixo + 'Categoria');
+      var boxFaixa = document.getElementById(prefixo + 'CatFaixaGrupo');
+      var boxPeso = document.getElementById(prefixo + 'CategoriaGrupo');
+      var doGrupo = CATEGORIAS_TORNEIO.filter(function (c) { return grupoCategoriaKey(c) === selGrupo.value; });
+
+      if (alvo === selGrupo) {
+        selPeso.innerHTML = '';
+        boxPeso.style.display = 'none';
+        if (!selGrupo.value) { boxFaixa.style.display = 'none'; selFaixa.innerHTML = ''; selFaixa.required = false; return; }
+        // Faixa do cadastro pode vir como "Nome - 2" (nome + grau): compara só pelo nome
+        var anterior = (selFaixa.value || selFaixa.getAttribute('data-faixa-atual') || '').replace(/\s+-\s+\d+\s*$/, '');
+        var lista = FAIXAS_UNIDADE.slice();
+        if (anterior && lista.indexOf(anterior) === -1) lista.unshift(anterior); // faixa do aluno fora da lista atual
+        selFaixa.innerHTML = opcoesSelect(lista.map(function (f) { return { valor: f, texto: f }; }), 'Selecione a faixa do atleta');
+        selFaixa.required = true;
+        boxFaixa.style.display = '';
+        if (anterior) {
+          selFaixa.value = anterior;
+          selFaixa.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return;
+      }
+
+      if (alvo === selFaixa) {
+        if (!selFaixa.value) { boxPeso.style.display = 'none'; selPeso.innerHTML = ''; return; }
+        var pesos = doGrupo.filter(function (c) { return categoriaAceitaFaixa(c, selFaixa.value); });
+        if (!pesos.length) pesos = doGrupo.slice(); // nenhuma bate pela cor: mostra todas da categoria
+        pesos = pesos.sort(function (a, b) { return (a.peso_max || 9999) - (b.peso_max || 9999); });
+        selPeso.innerHTML = opcoesSelect(pesos.map(function (c) {
+          return { valor: c.id, texto: labelPesoCat(c) + (c.vagas !== null ? ' - ' + textoVagas(c.vagas) : ''), desabilitado: c.vagas === 0 };
+        }), 'Selecione o peso do atleta');
+        boxPeso.style.display = '';
+        selecionarUnicaOpcao(selPeso);
+      }
+    });
+
+    // Ao escolher a delegação, lista as turmas/professores cadastrados nela
+    document.addEventListener('change', function (ev) {
+      if (!ev.target || ev.target.id !== 'visDelegacao') return;
+      var sel = document.getElementById('visTurmaDelegacao');
+      if (!sel) return;
+      var lista = TURMAS_DELEGACOES[ev.target.value] || [];
+      if (!ev.target.value) {
+        sel.innerHTML = '<option value="">Selecione primeiro a delegação</option>';
+        sel.disabled = true;
+        sel.required = false;
+      } else if (!lista.length) {
+        sel.innerHTML = '<option value="">Nenhuma turma/professor cadastrado nesta delegação</option>';
+        sel.disabled = true;
+        sel.required = false;
+      } else {
+        sel.innerHTML = '<option value="">Selecione a turma / professor</option>' + lista.map(function (t) {
+          return '<option value="' + t.id + '">' + escapeHtml(t.nome) + '</option>';
+        }).join('');
+        sel.disabled = false;
+        sel.required = true;
+      }
+    });
+
     function montarFormVisitante(tipo, eventoId, cpfDigits, incluirFaixa) {
       var cpfFormatado = cpfDigits.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4');
       var faixaCampo = incluirFaixa
-        ? '<div class="form-group"><label for="visFaixa">Faixa atual (se praticante)</label>' +
+        ? '<div class="form-group"><label for="visFaixa">Faixa atual do atleta (se praticante)</label>' +
           '<input type="text" id="visFaixa" name="faixa" placeholder="Ex: Branca, Azul..."></div>'
         : '';
+
+      var delegacaoCampo = '';
+      var categoriaCampo = '';
+      var turmaCampo = '';
+      if (tipo === 'torneio') {
+        if (DELEGACOES_TORNEIO.length) {
+          var opcoesDeleg = DELEGACOES_TORNEIO.map(function (d) {
+            return '<option value="' + d.id + '">' + escapeHtml(d.nome) + '</option>';
+          }).join('');
+          delegacaoCampo = '<div class="form-group"><label for="visDelegacao">Delegação / Academia</label>' +
+            '<select id="visDelegacao" name="delegacao_id" required><option value="">Selecione sua delegação</option>' +
+            opcoesDeleg + '</select></div>';
+        }
+
+        categoriaCampo = htmlCategoriaCascata('vis', 'categoria_id', 'faixa', '');
+
+        if (DELEGACOES_TORNEIO.length) {
+          // Turma / professor vem da delegação escolhida (preenchido no change de #visDelegacao)
+          turmaCampo = '<div class="form-group" id="grupoTurmaDelegacao"><label for="visTurmaDelegacao">Turma / Professor</label>' +
+            '<select id="visTurmaDelegacao" name="delegacao_turma_id" disabled><option value="">Selecione primeiro a delegação</option></select></div>';
+        } else if (TURMAS_TORNEIO.length) {
+          var opcoesTurmaTor = TURMAS_TORNEIO.map(function (t) {
+            return '<option value="' + t.id + '">' + escapeHtml(t.nome) + '</option>';
+          }).join('');
+          turmaCampo = '<div class="form-group"><label for="visTurmaTorneio">Turma do atleta</label>' +
+            '<select id="visTurmaTorneio" name="turma_id"><option value="">Selecione a turma do atleta</option>' +
+            opcoesTurmaTor + '</select></div>';
+        }
+      }
 
       return (
         '<h3>Complete seu cadastro</h3>' +
         '<p class="sub">Essa inscrição vale apenas para este evento.</p>' +
-        '<div class="form-group"><label>CPF</label><input type="text" value="' + escapeHtml(cpfFormatado) + '" disabled></div>' +
+        '<div class="form-group"><label>CPF do responsável</label><input type="text" value="' + escapeHtml(cpfFormatado) + '" disabled></div>' +
         '<form action="inscrever_visitante.php" method="POST">' +
         '<input type="hidden" name="tipo" value="' + escapeHtml(tipo) + '">' +
         '<input type="hidden" name="id" value="' + eventoId + '">' +
         '<input type="hidden" name="evento_id" value="' + eventoId + '">' +
         '<input type="hidden" name="cpf" value="' + escapeHtml(cpfDigits) + '">' +
-        '<div class="form-group"><label for="visNome">Nome completo</label>' +
-        '<input type="text" id="visNome" name="nome" required placeholder="Seu nome"></div>' +
-        '<div class="form-group"><label for="visNascimento">Data de nascimento</label>' +
-        '<input type="date" id="visNascimento" name="data_nascimento"></div>' +
-        '<div class="form-group"><label for="visTelefone">WhatsApp</label>' +
+        '<div class="form-group"><label for="visTelefone">WhatsApp do responsável</label>' +
         '<input type="tel" id="visTelefone" name="telefone" required placeholder="(45) 99999-9999"></div>' +
-        '<div class="form-group"><label for="visEmail">E-mail</label>' +
+        '<div class="form-group"><label for="visEmail">E-mail do responsável</label>' +
         '<input type="email" id="visEmail" name="email" placeholder="seu@email.com"></div>' +
+        '<div class="form-group"><label for="visNome">Nome completo do atleta</label>' +
+        '<input type="text" id="visNome" name="nome" required placeholder="Nome do atleta"></div>' +
+        '<div class="form-group"><label for="visNascimento">Ano de nascimento do atleta</label>' +
+        '<input type="text" id="visNascimento" name="ano_nascimento" inputmode="numeric" maxlength="4" pattern="(19|20)[0-9]{2}" placeholder="Ex: 2019" required title="Informe o ano com 4 dígitos, ex: 2019" oninput="this.value=this.value.replace(/[^0-9]/g,\'\').slice(0,4)"></div>' +
         faixaCampo +
-        '<button type="submit" class="btn btn--dark btn--lg">Confirmar inscrição de visitante' +
+        delegacaoCampo +
+        turmaCampo +
+        categoriaCampo +
+        '<button type="submit" class="btn btn--dark btn--lg">Confirmar inscrição' +
         '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7" /></svg>' +
         '</button>' +
         '</form>'
@@ -1219,21 +1538,21 @@ if ($evento) {
       return (
         '<h3>Complete seu cadastro</h3>' +
         '<p class="sub">Você será cadastrado como aluno visitante, apenas para este exame.</p>' +
-        '<div class="form-group"><label>CPF</label><input type="text" value="' + escapeHtml(cpfFormatado) + '" disabled></div>' +
+        '<div class="form-group"><label>CPF do responsável</label><input type="text" value="' + escapeHtml(cpfFormatado) + '" disabled></div>' +
         '<form action="inscrever_exame_visitante.php" method="POST">' +
         '<input type="hidden" name="evento_id" value="' + eventoId + '">' +
         '<input type="hidden" name="cpf" value="' + escapeHtml(cpfDigits) + '">' +
-        '<div class="form-group"><label for="visNome">Nome completo</label>' +
-        '<input type="text" id="visNome" name="nome_completo" required placeholder="Seu nome"></div>' +
-        '<div class="form-group"><label for="visNascimento">Data de nascimento</label>' +
+        '<div class="form-group"><label for="visTelefone">WhatsApp do responsável</label>' +
+        '<input type="tel" id="visTelefone" name="telefone" required placeholder="(45) 99999-9999"></div>' +
+        '<div class="form-group"><label for="visEmail">E-mail do responsável</label>' +
+        '<input type="email" id="visEmail" name="email" placeholder="seu@email.com"></div>' +
+        '<div class="form-group"><label for="visNome">Nome completo do atleta</label>' +
+        '<input type="text" id="visNome" name="nome_completo" required placeholder="Nome do atleta"></div>' +
+        '<div class="form-group"><label for="visNascimento">Data de nascimento do atleta</label>' +
         '<input type="date" id="visNascimento" name="data_nascimento"></div>' +
         '<div class="form-group"><label for="visGenero">Gênero</label>' +
         '<select id="visGenero" name="genero"><option value="masculino">Masculino</option><option value="feminino">Feminino</option><option value="outro">Outro</option></select></div>' +
-        '<div class="form-group"><label for="visTelefone">WhatsApp</label>' +
-        '<input type="tel" id="visTelefone" name="telefone" required placeholder="(45) 99999-9999"></div>' +
-        '<div class="form-group"><label for="visEmail">E-mail</label>' +
-        '<input type="email" id="visEmail" name="email" placeholder="seu@email.com"></div>' +
-        '<div class="form-group"><label for="visTurma">Turma</label>' +
+        '<div class="form-group"><label for="visTurma">Turma do atleta</label>' +
         '<select id="visTurma" name="turma_id" required><option value="">Selecione a turma</option>' + opcoesTurma + '</select></div>' +
         '<div class="form-group"><label for="visTamanhoFaixa">Tamanho da faixa (ex: M3, A2)</label>' +
         '<input type="text" id="visTamanhoFaixa" name="tamanho_faixa" placeholder="Ex: M3, A2"></div>' +
@@ -1263,14 +1582,20 @@ if ($evento) {
       msg.style.display = 'none';
 
       var digits = cpfInput.value.replace(/\D/g, '');
-      if (digits.length !== 11) {
-        msg.textContent = 'Digite um CPF válido.';
+      if (!cpfValido(digits)) {
+        msg.textContent = digits.length !== 11 ? 'Digite os 11 números do CPF.' : 'CPF inválido. Confira os números digitados.';
         msg.style.display = 'block';
         return;
       }
 
+      // Torneio segue o mesmo fluxo do visitante: digita o CPF do responsável e preenche
+      // os dados do atleta (sem listar os alunos já cadastrados com esse CPF).
+      continuarComoVisitante(tipo, eventoId, digits, cpfInput.value, msg);
+    }
+
+    function continuarComoVisitante(tipo, eventoId, digits, cpfOriginal, msg) {
       var fd = new FormData();
-      fd.append('cpf', cpfInput.value);
+      fd.append('cpf', cpfOriginal);
       fd.append('tipo', tipo);
       fd.append('evento_id', eventoId);
 
@@ -1288,6 +1613,110 @@ if ($evento) {
         })
         .catch(function () {
           msg.textContent = 'Erro ao verificar o CPF. Tente novamente.';
+          msg.style.display = 'block';
+        });
+    }
+
+    // ── Torneio: CPF encontrado entre os alunos da unidade -> escolhe o atleta -> categoria ──
+
+    var ALUNOS_TORNEIO_CACHE = [];
+
+    function voltarCpfTorneio() {
+      document.getElementById('passoVisitanteForm').style.display = 'none';
+      document.getElementById('passoVisitanteCpf').style.display = 'block';
+    }
+
+    function renderAlunosTorneio(eventoId) {
+      var html = '<h3>Selecione o atleta</h3>' +
+        '<p class="sub">Alunos encontrados para este CPF nesta unidade.</p>' +
+        '<div id="listaAlunosTorneio" class="lista-alunos"></div>' +
+        '<button type="button" class="btn btn--dark-outline" onclick="voltarCpfTorneio()" style="width:100%; justify-content:center; margin-top:8px;">Voltar</button>';
+
+      document.getElementById('passoVisitanteForm').innerHTML = html;
+
+      var lista = document.getElementById('listaAlunosTorneio');
+      ALUNOS_TORNEIO_CACHE.forEach(function (al) {
+        var card = document.createElement('div');
+        card.className = 'aluno-card' + (al.ja_inscrito ? ' is-disabled' : '');
+
+        var avatar = al.foto
+          ? '<img src="' + escapeHtml(al.foto) + '" alt="">'
+          : escapeHtml(iniciais(al.nome));
+
+        card.innerHTML =
+          '<div class="aluno-card__avatar">' + avatar + '</div>' +
+          '<div class="aluno-card__info">' +
+          '<strong>' + escapeHtml(al.nome) + '</strong>' +
+          '<span>Faixa ' + escapeHtml(al.faixa) + (al.turmas ? ' · ' + escapeHtml(al.turmas) : '') + (al.ja_inscrito ? ' · Já inscrito' : '') + '</span>' +
+          '</div>';
+
+        if (!al.ja_inscrito) {
+          card.addEventListener('click', function () { selecionarAlunoTorneio(al.id, al.nome, eventoId); });
+        }
+        lista.appendChild(card);
+      });
+    }
+
+    function selecionarAlunoTorneio(alunoId, nome, eventoId) {
+      var alCache = ALUNOS_TORNEIO_CACHE.filter(function (a) { return a.id === alunoId; })[0];
+      var categoriaCampo = htmlCategoriaCascata('tor', null, null, alCache ? alCache.faixa : '');
+
+      var html = '<h3>Confirme a inscrição</h3>' +
+        '<div class="form-group"><label>Atleta</label><input type="text" value="' + escapeHtml(nome) + '" disabled></div>' +
+        categoriaCampo +
+        '<div id="torneioConfirmMsg" class="form-alert form-alert--erro" style="display:none;"></div>' +
+        '<button type="button" class="btn btn--dark btn--lg" onclick="confirmarInscricaoTorneio(' + alunoId + ', \'' + eventoId + '\')">Confirmar inscrição' +
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12h14M12 5l7 7-7 7" /></svg>' +
+        '</button>' +
+        '<button type="button" class="btn btn--dark-outline" onclick="renderAlunosTorneio(\'' + eventoId + '\')" style="width:100%; justify-content:center; margin-top:8px;">Voltar</button>';
+
+      document.getElementById('passoVisitanteForm').innerHTML = html;
+    }
+
+    function confirmarInscricaoTorneio(alunoId, eventoId) {
+      var msg = document.getElementById('torneioConfirmMsg');
+      var catSelect = document.getElementById('torCategoria');
+      if (catSelect && !catSelect.value) {
+        msg.textContent = 'Selecione a categoria, a faixa e o peso.';
+        msg.style.display = 'block';
+        return;
+      }
+      var faixaSelect = document.getElementById('torCatFaixa');
+
+      var fd = new FormData();
+      fd.append('ajax', '1');
+      fd.append('evento_id', eventoId);
+      fd.append('aluno_id', alunoId);
+      if (catSelect) fd.append('categoria_id', catSelect.value);
+      if (faixaSelect && faixaSelect.value) fd.append('faixa', faixaSelect.value);
+
+      fetch('inscrever_torneio_aluno.php', { method: 'POST', body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data.success) {
+            msg.textContent = data.message || 'Não foi possível confirmar a inscrição.';
+            msg.style.display = 'block';
+            return;
+          }
+          // Marca esse aluno como já inscrito na lista em cache e volta pra ela,
+          // permitindo inscrever outro aluno do mesmo CPF sem digitar tudo de novo.
+          ALUNOS_TORNEIO_CACHE.forEach(function (al) {
+            if (al.id === alunoId) al.ja_inscrito = true;
+          });
+          renderAlunosTorneio(eventoId);
+          var lista = document.getElementById('listaAlunosTorneio');
+          var aviso = document.createElement('div');
+          aviso.className = 'form-alert form-alert--ok';
+          aviso.style.marginBottom = '12px';
+          aviso.innerHTML = '<i class="fa-solid fa-circle-check"></i> ' + escapeHtml(data.nome || 'Aluno') + ' inscrito com sucesso!';
+          if (data.link_pagamento) {
+            aviso.innerHTML += '<br><a href="' + escapeHtml(data.link_pagamento) + '" style="font-weight:800; text-decoration:underline;">' +
+              'Pagar inscrição via PIX (R$ ' + Number(data.valor).toFixed(2).replace('.', ',') + ')</a>';
+          }
+          lista.parentNode.insertBefore(aviso, lista);
+        })
+        .catch(function () {
+          msg.textContent = 'Erro ao confirmar. Tente novamente.';
           msg.style.display = 'block';
         });
     }

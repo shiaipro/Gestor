@@ -1,5 +1,6 @@
 <?php
 require_once '../Gestor/config.php';
+require_once __DIR__ . '/inc_cpf.php';
 header('Content-Type: application/json; charset=utf-8');
 
 function resposta($ok, $dados = [], $mensagem = '') {
@@ -17,8 +18,8 @@ $tipo = $_POST['tipo'] ?? '';
 $evento_id = (int) ($_POST['evento_id'] ?? 0);
 $cpf_digits = preg_replace('/\D/', '', $_POST['cpf'] ?? '');
 
-if (!$evento_id || !isset($tabelas_evento[$tipo]) || strlen($cpf_digits) !== 11) {
-    resposta(false, [], 'Informe um CPF válido.');
+if (!$evento_id || !isset($tabelas_evento[$tipo]) || !cpfValido($cpf_digits)) {
+    resposta(false, [], 'CPF inválido. Confira os números digitados.');
 }
 
 $cfg = $tabelas_evento[$tipo];
@@ -50,16 +51,10 @@ try {
         faixa VARCHAR(50) DEFAULT NULL,
         criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (unidade_id) REFERENCES unidades(id) ON DELETE CASCADE,
-        UNIQUE KEY unique_visitante_evento (evento_tipo, evento_id, cpf)
+        UNIQUE KEY unique_visitante_evento (evento_tipo, evento_id, cpf, nome(150))
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
 }
 
-$stmt_check = $pdo->prepare("SELECT nome FROM eventos_visitantes WHERE evento_tipo = ? AND evento_id = ? AND cpf = ?");
-$stmt_check->execute([$tipo, $evento_id, $cpf_digits]);
-$existente = $stmt_check->fetch();
-
-if ($existente) {
-    resposta(false, ['ja_inscrito' => true], 'Este CPF já está inscrito como visitante neste evento (' . $existente['nome'] . ').');
-}
-
+// O CPF é do responsável e pode inscrever mais de um atleta (ex: irmãos), por isso não
+// bloqueia aqui só pelo CPF — a duplicidade (CPF + nome do atleta) é checada ao gravar.
 resposta(true, ['cpf' => $cpf_digits]);
