@@ -1,6 +1,16 @@
 <?php
 require_once '../config.php';
 
+// Permissões de Eventos: ver a página exige 'visualizar'; qualquer alteração (POST ou
+// remoção de categoria por GET) exige 'editar'; excluir o evento inteiro exige 'remover'.
+exigirPermissaoEventos('visualizar', isset($_GET['ajax_chave']) || isset($_GET['ajax_elegiveis']));
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    exigirPermissaoEventos(isset($_POST['excluir_evento']) ? 'remover' : 'editar', isset($_POST['ajax_action']));
+}
+if (!empty($_GET['remover_categoria'])) {
+    exigirPermissaoEventos('editar');
+}
+
 $id = $_GET['id'] ?? null;
 $unidade_id = getUnidadeId();
 
@@ -13,20 +23,42 @@ if (!$id) {
 if (isset($_GET['ajax_chave'])) {
     $cat_id = $_GET['cat_id'];
     $lutas = $pdo->prepare("
-        SELECT l.*, 
+        SELECT l.*,
         i1.nome_externo as i1_nome_ext, a1.nome_completo as i1_nome_int,
         i2.nome_externo as i2_nome_ext, a2.nome_completo as i2_nome_int
         FROM competicao_lutas l
+        JOIN competicoes c ON c.id = l.competicao_id AND c.unidade_id = ?
         LEFT JOIN competicao_inscricoes i1 ON l.inscricao1_id = i1.id
         LEFT JOIN alunos a1 ON i1.aluno_id = a1.id
         LEFT JOIN competicao_inscricoes i2 ON l.inscricao2_id = i2.id
         LEFT JOIN alunos a2 ON i2.aluno_id = a2.id
-        WHERE l.categoria_id = ?
+        WHERE l.categoria_id = ? AND l.competicao_id = ?
         ORDER BY l.fase DESC, l.posicao ASC
     ");
-    $lutas->execute([$cat_id]);
+    $lutas->execute([$unidade_id, $cat_id, $id]);
     header('Content-Type: application/json');
     echo json_encode($lutas->fetchAll(PDO::FETCH_ASSOC));
+    exit;
+}
+
+// Handler AJAX: todos os inscritos de uma categoria, para o chaveamento simples.
+// Todos entram nas chaves; pagamento/pesagem pendentes só aparecem como aviso.
+if (isset($_GET['ajax_elegiveis'])) {
+    $cat_id = $_GET['cat_id'];
+    $stmt = $pdo->prepare("
+        SELECT i.id, COALESCE(a.nome_completo, i.nome_externo) AS nome,
+               IF(i.aluno_id IS NULL, i.equipe_externa, u.nome) AS equipe, i.peso_atleta,
+               i.status_pagamento, i.pesagem_status
+        FROM competicao_inscricoes i
+        JOIN competicoes c ON c.id = i.competicao_id AND c.unidade_id = ?
+        LEFT JOIN unidades u ON u.id = c.unidade_id
+        LEFT JOIN alunos a ON a.id = i.aluno_id
+        WHERE i.categoria_id = ? AND i.competicao_id = ?
+        ORDER BY i.peso_atleta IS NULL, i.peso_atleta ASC, nome ASC
+    ");
+    $stmt->execute([$unidade_id, $cat_id, $id]);
+    header('Content-Type: application/json');
+    echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
     exit;
 }
 
@@ -66,6 +98,58 @@ $comp = $stmt_comp->fetch();
 
 if (!$comp) {
     header('Location: competicoes.php');
+    exit;
+}
+
+// Excluir evento (aba Ajustes > Zona de perigo) — exige permissão 'remover' de Eventos e digitar EXCLUIR.
+// Fica antes do header.php para poder redirecionar com header('Location:').
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['excluir_evento'])) {
+    if (!temPermissaoEventos('remover') || strtoupper(trim($_POST['confirmacao_exclusao'] ?? '')) !== 'EXCLUIR') {
+        header('Location: editar_competicao.php?id=' . (int) $id . '&tab=info&erro_exclusao=1');
+        exit;
+    }
+
+    $tabelas_filhas = [
+        'competicao_lutas'        => 'competicao_id = ?',
+        'competicao_inscricoes'   => 'competicao_id = ?',
+        'competicao_categorias'   => 'competicao_id = ?',
+        'competicao_lotes'        => 'competicao_id = ?',
+        'competicao_lancamentos'  => 'competicao_id = ?',
+        'competicao_patrocinios'  => 'competicao_id = ?',
+        'competicao_convidados'   => 'competicao_id = ?',
+        'eventos_visitantes'      => "evento_tipo = 'torneio' AND evento_id = ?",
+    ];
+
+    try {
+        $pdo->beginTransaction();
+        foreach ($tabelas_filhas as $tabela => $filtro) {
+            if (!$pdo->query("SHOW TABLES LIKE " . $pdo->quote($tabela))->fetch()) {
+                continue;
+            }
+            $pdo->prepare("DELETE FROM $tabela WHERE $filtro")->execute([$id]);
+        }
+        $pdo->prepare("DELETE FROM competicoes WHERE id = ? AND unidade_id = ?")->execute([$id, $unidade_id]);
+        $pdo->commit();
+    } catch (PDOException $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        header('Location: editar_competicao.php?id=' . (int) $id . '&tab=info&erro_exclusao=1');
+        exit;
+    }
+
+    // Remove as fotos do evento do disco (depois do commit — falha aqui não desfaz a exclusão)
+    $fotos_excluir = json_decode($comp['fotos'] ?? '[]', true);
+    if (is_array($fotos_excluir)) {
+        foreach ($fotos_excluir as $f) {
+            $arq = __DIR__ . '/../uploads/competicoes/' . basename($f);
+            if (is_file($arq)) {
+                @unlink($arq);
+            }
+        }
+    }
+
+    header('Location: competicoes.php?excluido=1');
     exit;
 }
 
@@ -166,6 +250,14 @@ try {
         ");
     }
 
+    // Automigração Tabela Categorias (limite de atletas por categoria)
+    $column_check_limite = $pdo->query("SHOW COLUMNS FROM competicao_categorias LIKE 'limite_atletas'")->fetch();
+    if (!$column_check_limite) {
+        $pdo->exec("ALTER TABLE competicao_categorias
+            ADD COLUMN limite_atletas INT DEFAULT NULL AFTER peso_max
+        ");
+    }
+
     // Automigração: novos campos de contato completo da academia (email, site, whatsapp, país, técnico, financeiro)
     $col_check_deleg = $pdo->query("SHOW COLUMNS FROM delegacoes_visitantes LIKE 'email'")->fetch();
     if (!$col_check_deleg) {
@@ -180,6 +272,15 @@ try {
             ADD COLUMN financeiro_telefone VARCHAR(30) DEFAULT NULL AFTER financeiro_nome
         ");
     }
+
+    // Automigração: tipo de chaveamento (olímpica x simples) e número da chave (grupo) no chaveamento simples
+    $col_check_tipo_chave = $pdo->query("SHOW COLUMNS FROM competicao_lutas LIKE 'tipo_chave'")->fetch();
+    if (!$col_check_tipo_chave) {
+        $pdo->exec("ALTER TABLE competicao_lutas
+            ADD COLUMN tipo_chave VARCHAR(20) NOT NULL DEFAULT 'olimpica',
+            ADD COLUMN grupo INT DEFAULT NULL
+        ");
+    }
 } catch (Exception $e) {
     // Ignorar erros se já existir
 }
@@ -191,6 +292,9 @@ $custom_shortcuts = [
     ['label' => 'NOVO TORNEIO', 'link' => 'nova_competicao.php', 'icon' => 'fa-solid fa-plus-circle', 'class' => 'btn-sq'],
     ['label' => 'NOVO EXAME', 'link' => 'novo_evento_faixa.php', 'icon' => 'fa-solid fa-medal', 'class' => 'btn-sq-outline']
 ];
+if (!temPermissaoEventos('criar')) {
+    $custom_shortcuts = [];
+}
 include 'header.php';
 ?>
 
@@ -233,6 +337,24 @@ include 'header.php';
     if (($_GET['sucesso'] ?? '') === 'convidada') {
         $mensagem = "Academia cadastrada e convidada com sucesso!";
     }
+    if (($_GET['sucesso'] ?? '') === 'categoria_criada') {
+        $mensagem = "Categoria criada!";
+    }
+    if (($_GET['sucesso'] ?? '') === 'categoria_removida') {
+        $mensagem = "Categoria removida!";
+    }
+    if (($_GET['sucesso'] ?? '') === 'categoria_atualizada') {
+        $mensagem = "Categoria atualizada!";
+    }
+
+    // Excluir categoria — chega por GET (link do botão "Excluir"), por isso fica fora
+    // do bloco de POST logo abaixo.
+    if (!empty($_GET['remover_categoria'])) {
+        $pdo->prepare("DELETE FROM competicao_categorias WHERE id = ? AND competicao_id = ?")
+            ->execute([$_GET['remover_categoria'], $id]);
+        echo "<script>window.location.href = 'editar_competicao.php?id=" . (int) $id . "&tab=categorias&sucesso=categoria_removida';</script>";
+        exit;
+    }
 
     // Processar formulário
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -243,6 +365,23 @@ include 'header.php';
                 $fotos_atuais = json_decode($comp['fotos'] ?? '[]', true);
                 if (!is_array($fotos_atuais))
                     $fotos_atuais = [];
+
+                // Remover fotos marcadas na galeria (só aceita nomes que já pertencem a este evento)
+                $fotos_remover = array_map('basename', (array) ($_POST['remover_fotos'] ?? []));
+                if ($fotos_remover) {
+                    $fotos_mantidas = [];
+                    foreach ($fotos_atuais as $f) {
+                        if (in_array(basename($f), $fotos_remover, true)) {
+                            $arq = __DIR__ . '/../uploads/competicoes/' . basename($f);
+                            if (is_file($arq)) {
+                                @unlink($arq);
+                            }
+                        } else {
+                            $fotos_mantidas[] = $f;
+                        }
+                    }
+                    $fotos_atuais = $fotos_mantidas;
+                }
 
                 if (isset($_FILES['novas_fotos']) && count($_FILES['novas_fotos']['name']) > 0) {
                     if (!is_dir("../uploads/competicoes/"))
@@ -304,28 +443,49 @@ include 'header.php';
         // 2. Gestão de Categorias
         if (isset($_POST['nova_categoria'])) {
             try {
-                $stmt = $pdo->prepare("INSERT INTO competicao_categorias (competicao_id, nome, sexo, ano_nascimento_min,
-ano_nascimento_max, faixas, peso_max) VALUES (?, ?, ?, ?, ?, ?, ?)");
-                $stmt->execute([
-                    $id,
-                    $_POST['cat_nome'],
-                    $_POST['cat_sexo'],
-                    $_POST['ano_min'] ?: null,
-                    $_POST['ano_max'] ?: null,
-                    $_POST['cat_faixas'],
-                    $_POST['cat_peso'] ?: null
-                ]);
-                $mensagem = "Categoria criada!";
+                $cat_id_editar = $_POST['cat_id_editar'] ?? '';
+
+                if ($cat_id_editar !== '') {
+                    // Edição: garante que a categoria pertence a este torneio antes de alterar
+                    $stmt = $pdo->prepare("UPDATE competicao_categorias SET nome = ?, sexo = ?, ano_nascimento_min = ?,
+ano_nascimento_max = ?, faixas = ?, peso_max = ?, limite_atletas = ? WHERE id = ? AND competicao_id = ?");
+                    $stmt->execute([
+                        $_POST['nome'],
+                        $_POST['sexo'],
+                        $_POST['ano_nascimento_min'] ?: null,
+                        $_POST['ano_nascimento_max'] ?: null,
+                        $_POST['faixas'],
+                        $_POST['peso_max'] ?: null,
+                        $_POST['limite_atletas'] ?: null,
+                        $cat_id_editar,
+                        $id
+                    ]);
+                    $sucesso_cat = 'categoria_atualizada';
+                } else {
+                    $stmt = $pdo->prepare("INSERT INTO competicao_categorias (competicao_id, nome, sexo, ano_nascimento_min,
+ano_nascimento_max, faixas, peso_max, limite_atletas) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+                    $stmt->execute([
+                        $id,
+                        $_POST['nome'],
+                        $_POST['sexo'],
+                        $_POST['ano_nascimento_min'] ?: null,
+                        $_POST['ano_nascimento_max'] ?: null,
+                        $_POST['faixas'],
+                        $_POST['peso_max'] ?: null,
+                        $_POST['limite_atletas'] ?: null
+                    ]);
+                    $sucesso_cat = 'categoria_criada';
+                }
+
+                // header.php já enviou HTML nesse ponto — não dá pra usar header('Location:'),
+                // então o redirect (PRG, evita reenvio de formulário) é feito via JS.
+                echo "<script>window.location.href = 'editar_competicao.php?id=" . (int) $id . "&tab=categorias&sucesso=$sucesso_cat';</script>";
+                exit;
             } catch (PDOException $e) {
                 $erro = $e->getMessage();
             }
         }
 
-        if (isset($_POST['remover_categoria']) || (isset($_GET['remover_categoria']) && !empty($_GET['remover_categoria']))) {
-            $cat_id_to_del = $_POST['cat_delete_id'] ?? $_GET['remover_categoria'];
-            $pdo->prepare("DELETE FROM competicao_categorias WHERE id = ?")->execute([$cat_id_to_del]);
-            $mensagem = "Categoria removida!";
-        }
 
         // 3. Gestão de Lotes de Preço
         if (isset($_POST['novo_lote'])) {
@@ -374,11 +534,41 @@ ano_nascimento_max, faixas, peso_max) VALUES (?, ?, ?, ?, ?, ?, ?)");
 
         // 5. Gestão Financeira (Lançamentos)
         if (isset($_POST['novo_lancamento'])) {
-            $valor = str_replace(',', '.', $_POST['fin_valor']);
-            $stmt = $pdo->prepare("INSERT INTO competicao_lancamentos (competicao_id, tipo, descricao, valor, data_lancamento)
-VALUES (?, ?, ?, ?, CURDATE())");
-            $stmt->execute([$id, $_POST['fin_tipo'], $_POST['fin_desc'], $valor]);
-            $mensagem = "Lançamento financeiro realizado!";
+            try {
+                $lanc_id_edit = (int) ($_POST['edit_lanc_id'] ?? 0);
+                $tipo = ($_POST['fin_tipo'] ?? '') === 'despesa' ? 'despesa' : 'receita';
+                $valor_bruto = trim($_POST['fin_valor']);
+                // Aceita "1.500,00" e "1500,00" (formato pt-BR) e "1500.00"
+                $valor = strpos($valor_bruto, ',') !== false
+                    ? str_replace(',', '.', str_replace('.', '', $valor_bruto))
+                    : $valor_bruto;
+                $valor = preg_replace('/[^0-9.]/', '', $valor);
+                $data_lanc = !empty($_POST['fin_data']) ? $_POST['fin_data'] : date('Y-m-d');
+
+                if ($lanc_id_edit) {
+                    $stmt = $pdo->prepare("UPDATE competicao_lancamentos SET tipo = ?, descricao = ?, valor = ?, data_lancamento = ?
+                        WHERE id = ? AND competicao_id = ?");
+                    $stmt->execute([$tipo, $_POST['fin_desc'], $valor, $data_lanc, $lanc_id_edit, $id]);
+                    $mensagem = "Lançamento atualizado!";
+                } else {
+                    $stmt = $pdo->prepare("INSERT INTO competicao_lancamentos (competicao_id, tipo, descricao, valor, data_lancamento)
+VALUES (?, ?, ?, ?, ?)");
+                    $stmt->execute([$id, $tipo, $_POST['fin_desc'], $valor, $data_lanc]);
+                    $mensagem = "Lançamento financeiro realizado!";
+                }
+            } catch (Exception $e) {
+                $erro = "Erro no lançamento: " . $e->getMessage();
+            }
+        }
+
+        if (isset($_POST['remover_lancamento'])) {
+            try {
+                $pdo->prepare("DELETE FROM competicao_lancamentos WHERE id = ? AND competicao_id = ?")
+                    ->execute([$_POST['lanc_delete_id'], $id]);
+                $mensagem = "Lançamento removido!";
+            } catch (Exception $e) {
+                $erro = "Erro ao remover lançamento: " . $e->getMessage();
+            }
         }
 
         // 6. Inscrever/Editar Aluno
@@ -397,6 +587,24 @@ VALUES (?, ?, ?, ?, CURDATE())");
 
                 $valor_pago = str_replace(',', '.', str_replace('.', '', $_POST['valor_pago'] ?? '0,00'));
                 $status_pagto = $_POST['status_pagamento'] ?? 'pendente';
+
+                // Controle de limite de atletas por categoria: a vaga só é consumida quando a
+                // inscrição está paga — pendentes ficam de fora da contagem para o gestor acompanhar.
+                if ($cat_id && $status_pagto === 'pago') {
+                    $stmt_lim = $pdo->prepare("SELECT limite_atletas, nome FROM competicao_categorias WHERE id = ? AND competicao_id = ?");
+                    $stmt_lim->execute([$cat_id, $id]);
+                    $cat_lim = $stmt_lim->fetch();
+
+                    if ($cat_lim && $cat_lim['limite_atletas']) {
+                        $stmt_cnt = $pdo->prepare("SELECT COUNT(*) FROM competicao_inscricoes WHERE categoria_id = ? AND status_pagamento = 'pago' AND id != ?");
+                        $stmt_cnt->execute([$cat_id, $insc_id ?: 0]);
+                        $total_pagos_cat = (int) $stmt_cnt->fetchColumn();
+
+                        if ($total_pagos_cat >= (int) $cat_lim['limite_atletas']) {
+                            throw new Exception("A categoria \"{$cat_lim['nome']}\" já atingiu o limite de {$cat_lim['limite_atletas']} atleta(s) pago(s).");
+                        }
+                    }
+                }
 
                 if ($insc_id) {
                     // UPDATE
@@ -422,7 +630,7 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                     $stmt->execute([$id, $aluno_id, $cat_id, $lote_id, $nome_ext, $equipe_ext, $faixa_ext, $valor_pago, $status_pagto]);
                     $mensagem = "Inscrição realizada com sucesso!";
                 }
-            } catch (PDOException $e) {
+            } catch (Exception $e) {
                 $erro = "Erro ao processar inscrição: " . $e->getMessage();
             }
         }
@@ -544,21 +752,93 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
             }
         }
 
+        // 7b. Gerar Chaveamento Simples (atletas divididos em chaves, todos contra todos dentro de cada chave)
+        if (isset($_POST['gerar_chave_simples'])) {
+            $cat_id = $_POST['categoria_id_simples'];
+            try {
+                $grupos = json_decode($_POST['grupos_json'] ?? '[]', true);
+                if (!is_array($grupos)) {
+                    $grupos = [];
+                }
+                // Remove chaves vazias que o gestor tenha deixado sem atletas
+                $grupos = array_values(array_filter(array_map(function ($g) {
+                    return is_array($g) ? array_values(array_map('intval', $g)) : [];
+                }, $grupos)));
+
+                // No chaveamento simples entram todos os inscritos da categoria (pagamento/pesagem não bloqueiam)
+                $stmt = $pdo->prepare("SELECT id FROM competicao_inscricoes WHERE categoria_id = ? AND competicao_id = ?");
+                $stmt->execute([$cat_id, $id]);
+                $elegiveis = array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+
+                $todos = array_merge([], ...$grupos);
+                if (empty($grupos)) {
+                    throw new Exception("Nenhuma chave foi montada.");
+                }
+                if (count($todos) !== count(array_unique($todos))) {
+                    throw new Exception("Um atleta não pode estar em mais de uma chave.");
+                }
+                if (array_diff($todos, $elegiveis)) {
+                    throw new Exception("Há atletas nas chaves que não estão inscritos nesta categoria.");
+                }
+                foreach ($grupos as $n => $g) {
+                    if (count($g) < 2) {
+                        throw new Exception("A Chave " . ($n + 1) . " precisa ter pelo menos 2 atletas.");
+                    }
+                }
+
+                $pdo->beginTransaction();
+                $pdo->prepare("DELETE FROM competicao_lutas WHERE categoria_id = ? AND competicao_id = ?")->execute([$cat_id, $id]);
+
+                $stmt_ins = $pdo->prepare("INSERT INTO competicao_lutas (competicao_id, categoria_id, fase, posicao, inscricao1_id, inscricao2_id, status, tipo_chave, grupo)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pendente', 'simples', ?)");
+                $total_lutas = 0;
+                foreach ($grupos as $n => $g) {
+                    // Rodízio pelo método do círculo: cada "fase" é uma rodada, evitando lutas seguidas do mesmo atleta
+                    $roda = $g;
+                    if (count($roda) % 2) {
+                        $roda[] = null;
+                    }
+                    $qtd = count($roda);
+                    $posicao = 0;
+                    for ($rodada = 1; $rodada < $qtd; $rodada++) {
+                        for ($k = 0; $k < $qtd / 2; $k++) {
+                            $a = $roda[$k];
+                            $b = $roda[$qtd - 1 - $k];
+                            if ($a && $b) {
+                                $stmt_ins->execute([$id, $cat_id, $rodada, $posicao++, $a, $b, $n + 1]);
+                                $total_lutas++;
+                            }
+                        }
+                        // Gira todos menos o primeiro
+                        $ultimo = array_pop($roda);
+                        array_splice($roda, 1, 0, [$ultimo]);
+                    }
+                }
+                $pdo->commit();
+                $mensagem = "Chaveamento simples gerado: " . count($grupos) . " chave(s), $total_lutas luta(s)!";
+            } catch (Exception $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $erro = "Erro ao gerar chaveamento simples: " . $e->getMessage();
+            }
+        }
+
         // 8. Definir Vencedor
         if (isset($_POST['definir_vencedor'])) {
             $luta_id = $_POST['luta_id'];
             $vencedor_id = $_POST['vencedor_id'];
             try {
                 // Atualizar luta atual
-                $stmt = $pdo->prepare("UPDATE competicao_lutas SET vencedor_id = ?, status = 'finalizada' WHERE id = ?");
-                $stmt->execute([$vencedor_id, $luta_id]);
+                $stmt = $pdo->prepare("UPDATE competicao_lutas SET vencedor_id = ?, status = 'finalizada' WHERE id = ? AND competicao_id = ?");
+                $stmt->execute([$vencedor_id, $luta_id, $id]);
 
                 // Avançar para próxima luta
-                $stmt = $pdo->prepare("SELECT proxima_luta_id, posicao FROM competicao_lutas WHERE id = ?");
-                $stmt->execute([$luta_id]);
+                $stmt = $pdo->prepare("SELECT proxima_luta_id, posicao FROM competicao_lutas WHERE id = ? AND competicao_id = ?");
+                $stmt->execute([$luta_id, $id]);
                 $luta = $stmt->fetch();
 
-                if ($luta['proxima_luta_id']) {
+                if ($luta && $luta['proxima_luta_id']) {
                     $prox_id = $luta['proxima_luta_id'];
                     // Determinar se entra como inscricao1 ou inscricao2 na próxima
                     // Se a posição atual for par, é inscricao1. Se impar, é inscricao2.
@@ -575,6 +855,23 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         if (isset($_POST['baixar_pagamento'])) {
             try {
                 $insc_id = $_POST['insc_id_baixa'];
+
+                // Controle de limite: antes de efetivar o pagamento, garante que a categoria ainda tem vaga
+                $stmt_cat = $pdo->prepare("SELECT cc.id, cc.nome, cc.limite_atletas FROM competicao_inscricoes ci
+                    JOIN competicao_categorias cc ON cc.id = ci.categoria_id WHERE ci.id = ?");
+                $stmt_cat->execute([$insc_id]);
+                $cat_baixa = $stmt_cat->fetch();
+
+                if ($cat_baixa && $cat_baixa['limite_atletas']) {
+                    $stmt_cnt = $pdo->prepare("SELECT COUNT(*) FROM competicao_inscricoes WHERE categoria_id = ? AND status_pagamento = 'pago' AND id != ?");
+                    $stmt_cnt->execute([$cat_baixa['id'], $insc_id]);
+                    $total_pagos_cat = (int) $stmt_cnt->fetchColumn();
+
+                    if ($total_pagos_cat >= (int) $cat_baixa['limite_atletas']) {
+                        throw new Exception("A categoria \"{$cat_baixa['nome']}\" já atingiu o limite de {$cat_baixa['limite_atletas']} atleta(s) pago(s).");
+                    }
+                }
+
                 $stmt = $pdo->prepare("UPDATE competicao_inscricoes SET status_pagamento = 'pago' WHERE id = ?");
                 $stmt->execute([$insc_id]);
                 $mensagem = "Pagamento baixado com sucesso! Inscrição efetivada.";
@@ -585,10 +882,15 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
     }
 
     // Queries de Exibição
-    $categorias = $pdo->prepare("SELECT * FROM competicao_categorias WHERE competicao_id = ? ORDER BY nome
-            ASC");
+    $categorias = $pdo->prepare("SELECT cc.*,
+            (SELECT COUNT(*) FROM competicao_inscricoes ci WHERE ci.categoria_id = cc.id AND ci.status_pagamento = 'pago') as total_pagos,
+            (SELECT COUNT(*) FROM competicao_inscricoes ci WHERE ci.categoria_id = cc.id AND ci.status_pagamento != 'pago') as total_pendentes
+            FROM competicao_categorias cc WHERE cc.competicao_id = ?");
     $categorias->execute([$id]);
     $categorias = $categorias->fetchAll();
+    usort($categorias, function ($a, $b) {
+        return strnatcasecmp($a['nome'], $b['nome']);
+    });
 
     $lotes = $pdo->prepare("SELECT * FROM competicao_lotes WHERE competicao_id = ? ORDER BY data_limite ASC");
     $lotes->execute([$id]);
@@ -634,18 +936,85 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
     $delegacoes_disponiveis->execute([$unidade_id, $id]);
     $delegacoes_disponiveis = $delegacoes_disponiveis->fetchAll();
 
-    // Totais Financeiros
-    $total_receita = 0;
-    $total_despesa = 0;
+    // ── Totais Financeiros ──
+    // Receita = inscrições PAGAS + patrocínios + lançamentos extras de receita.
+    // Despesa = lançamentos extras de despesa + custos fixos por inscrição paga (CUSTO_INSCRICAO_EVENTO).
+    $fin_extras_receita = 0;
+    $fin_extras_despesa = 0;
     foreach ($lancamentos as $l) {
         if ($l['tipo'] == 'receita')
-            $total_receita += $l['valor'];
+            $fin_extras_receita += $l['valor'];
         else
-            $total_despesa += $l['valor'];
+            $fin_extras_despesa += $l['valor'];
     }
-    foreach ($patrocinios as $p) {
-        $total_receita += $p['valor_cota'];
+    $fin_patrocinios = array_sum(array_map('floatval', array_column($patrocinios, 'valor_cota')));
+
+    $fin_nome_casa = $unidade_nome ?? 'Unidade (casa)';
+    $lotes_por_id = [];
+    foreach ($lotes as $lt) {
+        $lotes_por_id[$lt['id']] = $lt;
     }
+
+    $fin_insc_pagas = 0;          // quantidade
+    $fin_insc_pendentes = 0;      // quantidade
+    $fin_receita_inscricoes = 0;  // R$ pago
+    $fin_a_receber = 0;           // R$ pendente
+    $fin_custos_inscricao = 0;    // R$ custos das pagas
+    $fin_por_lote = [];           // relatório por lote
+    $fin_por_equipe = [];         // relatório por delegação / equipe
+    foreach ($inscritos as $in) {
+        $valor = (float) $in['valor_pago'];
+        $pago = ($in['status_pagamento'] === 'pago');
+        $custo = ($pago && $valor > 0) ? CUSTO_INSCRICAO_EVENTO : 0;
+
+        $chave_lote = $in['lote_id'] && isset($lotes_por_id[$in['lote_id']]) ? $in['lote_id'] : 0;
+        if (!isset($fin_por_lote[$chave_lote])) {
+            $fin_por_lote[$chave_lote] = [
+                'nome' => $chave_lote ? $lotes_por_id[$chave_lote]['nome'] : 'Sem lote / manual',
+                'valor' => $chave_lote ? (float) $lotes_por_id[$chave_lote]['valor'] : null,
+                'pagas' => 0, 'pendentes' => 0, 'bruto' => 0, 'a_receber' => 0, 'custos' => 0,
+            ];
+        }
+        $equipe = $in['aluno_id'] ? $fin_nome_casa : (trim((string) $in['equipe_externa']) ?: 'Sem equipe informada');
+        if (!isset($fin_por_equipe[$equipe])) {
+            $fin_por_equipe[$equipe] = ['pagas' => 0, 'pendentes' => 0, 'bruto' => 0, 'a_receber' => 0, 'custos' => 0];
+        }
+
+        if ($pago) {
+            $fin_insc_pagas++;
+            $fin_receita_inscricoes += $valor;
+            $fin_custos_inscricao += $custo;
+            $fin_por_lote[$chave_lote]['pagas']++;
+            $fin_por_lote[$chave_lote]['bruto'] += $valor;
+            $fin_por_lote[$chave_lote]['custos'] += $custo;
+            $fin_por_equipe[$equipe]['pagas']++;
+            $fin_por_equipe[$equipe]['bruto'] += $valor;
+            $fin_por_equipe[$equipe]['custos'] += $custo;
+        } else {
+            $fin_insc_pendentes++;
+            $fin_a_receber += $valor;
+            $fin_por_lote[$chave_lote]['pendentes']++;
+            $fin_por_lote[$chave_lote]['a_receber'] += $valor;
+            $fin_por_equipe[$equipe]['pendentes']++;
+            $fin_por_equipe[$equipe]['a_receber'] += $valor;
+        }
+    }
+    uasort($fin_por_equipe, function ($a, $b) { return $b['bruto'] <=> $a['bruto']; });
+    ksort($fin_por_lote);
+
+    $fin_ticket_medio = $fin_insc_pagas ? $fin_receita_inscricoes / $fin_insc_pagas : 0;
+
+    // Lote vigente = primeiro com data limite >= hoje (lotes já vêm ordenados por data_limite)
+    $fin_lote_vigente = null;
+    foreach ($lotes as $lt) {
+        if (!empty($lt['data_limite']) && $lt['data_limite'] >= date('Y-m-d')) {
+            $fin_lote_vigente = $lt;
+            break;
+        }
+    }
+
+    $total_receita = $fin_receita_inscricoes + $fin_patrocinios + $fin_extras_receita;
+    $total_despesa = $fin_extras_despesa + $fin_custos_inscricao;
     ?>
 
     <style>
@@ -782,10 +1151,22 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
 
 
     <?php if ($mensagem): ?>
-        <div class="alert"
+        <div class="alert" id="alertaMensagemSucesso"
             style="background:#dcfce7; color:#166534; padding:1rem; margin-bottom:1rem; border: 1px solid #bbf7d0; font-weight: 600; border-radius: 0;">
             <?php echo $mensagem; ?>
         </div>
+        <script>
+            // Evita que o aviso fique preso na tela ao trocar de aba ou reabrir a página (F5)
+            setTimeout(function () {
+                var el = document.getElementById('alertaMensagemSucesso');
+                if (el) el.style.display = 'none';
+            }, 4000);
+            if (window.history.replaceState) {
+                var urlLimpa = new URL(window.location.href);
+                urlLimpa.searchParams.delete('sucesso');
+                window.history.replaceState({}, document.title, urlLimpa.toString());
+            }
+        </script>
     <?php endif; ?>
     <?php if ($erro): ?>
         <div class="alert"
@@ -849,7 +1230,22 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
             foreach ($inscritos as $in)
                 if ($in['status_pagamento'] == 'pago')
                     $receita_insc += $in['valor_pago'];
+            $msg_wpp_marketing = 'Olá! Quero saber sobre cards, banners e outros produtos para a competição "' . ($comp['nome'] ?? '') . '".';
+            $link_wpp_marketing = 'https://wa.me/5545991574733?text=' . rawurlencode($msg_wpp_marketing);
             ?>
+            <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:1rem; margin-bottom:1.5rem; padding:1.25rem 1.5rem; background:linear-gradient(135deg, #133080 0%, #3b5fd1 100%); color:#fff; border-radius:0; box-shadow:var(--shadow-sm);">
+                <div style="display:flex; align-items:center; gap:1rem; min-width:0;">
+                    <i class="fa-solid fa-palette" style="font-size:2rem; color:#f5a623; flex-shrink:0;"></i>
+                    <div>
+                        <div style="font-weight:800; font-size:1.05rem; text-transform:uppercase; letter-spacing:0.03em;">Divulgue sua competição com estilo</div>
+                        <div style="font-size:0.875rem; opacity:0.9;">Criamos cards para redes sociais, banners e outros produtos personalizados para o seu evento.</div>
+                    </div>
+                </div>
+                <a href="<?php echo htmlspecialchars($link_wpp_marketing); ?>" target="_blank" rel="noopener"
+                    style="display:inline-flex; align-items:center; gap:0.5rem; background:#25d366; color:#fff; font-weight:800; padding:0.75rem 1.25rem; text-decoration:none; text-transform:uppercase; font-size:0.85rem; white-space:nowrap;">
+                    <i class="fa-brands fa-whatsapp" style="font-size:1.2rem;"></i> Falar no WhatsApp
+                </a>
+            </div>
             <div class="dash-grid">
                 <div class="dash-card">
                     <h4>Atletas Total</h4>
@@ -1174,12 +1570,20 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                         <?php
                                         $fotos = json_decode($comp['fotos'] ?? '[]', true);
                                         if (is_array($fotos)):
-                                            foreach ($fotos as $f):
+                                            foreach ($fotos as $i => $f):
                                                 ?>
-                                                <div
+                                                <div class="foto-galeria"
                                                     style="position: relative; aspect-ratio: 1; border-radius: 0; overflow: hidden; border: 2px solid var(--border);">
-                                                    <img src="../uploads/competicoes/<?php echo $f; ?>"
+                                                    <img src="../uploads/competicoes/<?php echo htmlspecialchars(rawurlencode(basename($f))); ?>"
                                                         style="width: 100%; height: 100%; object-fit: cover;">
+                                                    <?php if ($i === 0): ?>
+                                                        <span style="position: absolute; left: 0; bottom: 0; right: 0; background: rgba(0,0,0,0.6); color: #fff; font-size: 0.6rem; font-weight: 800; text-transform: uppercase; padding: 2px 4px; text-align: center;">Capa</span>
+                                                    <?php endif; ?>
+                                                    <input type="checkbox" name="remover_fotos[]" value="<?php echo htmlspecialchars(basename($f)); ?>" style="display: none;">
+                                                    <button type="button" onclick="alternarRemoverFoto(this, event)" title="Remover foto"
+                                                        style="position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; border: none; border-radius: 50%; background: var(--danger, #dc2626); color: #fff; font-size: 0.75rem; cursor: pointer; display: flex; align-items: center; justify-content: center;">
+                                                        <i class="fa-solid fa-xmark"></i>
+                                                    </button>
                                                 </div>
                                             <?php endforeach; endif; ?>
                                     </div>
@@ -1287,10 +1691,12 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                 style="width: auto; padding: 0.85rem 1.75rem; font-weight: 800;">
                                 <i class="fa-solid fa-plus"></i> Convidar
                             </button>
+                            <?php if (temPermissaoEventos('criar')): ?>
                             <a href="nova_delegacao.php?evento_id=<?php echo $id; ?>" class="btn-sq-light"
                                 style="width: auto; padding: 0.85rem 1.75rem; font-weight: 800; white-space: nowrap;">
                                 <i class="fa-solid fa-circle-plus"></i> Cadastrar Nova Academia
                             </a>
+                            <?php endif; ?>
                         </form>
 
                         <?php if (empty($convidados)): ?>
@@ -1350,6 +1756,27 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                         ATUALIZAR COMPETIÇÃO
                     </button>
                 </div>
+
+                <?php if (temPermissaoEventos('remover')): ?>
+                    <!-- Zona de perigo: discreta de propósito (recolhida, texto pequeno) -->
+                    <details style="margin-top: 3rem; font-size: 0.75rem; color: var(--text-muted);" <?php echo !empty($_GET['erro_exclusao']) ? 'open' : ''; ?>>
+                        <summary style="cursor: pointer; display: inline-block; opacity: 0.7;">Opções avançadas</summary>
+                        <form method="POST" onsubmit="return confirm('Excluir DEFINITIVAMENTE este evento e todas as inscrições, categorias, lutas e lançamentos financeiros? Essa ação não pode ser desfeita.');"
+                            style="margin-top: 1rem; padding: 1rem; border: 1px dashed var(--border); display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem;">
+                            <input type="hidden" name="excluir_evento" value="1">
+                            <span>Para excluir este evento, digite <strong>EXCLUIR</strong>:</span>
+                            <input type="text" name="confirmacao_exclusao" autocomplete="off" required
+                                class="form-control" style="width: 140px; padding: 0.35rem 0.5rem; font-size: 0.75rem;">
+                            <button type="submit"
+                                style="background: none; border: none; color: var(--danger, #dc3545); font-size: 0.75rem; text-decoration: underline; cursor: pointer; padding: 0;">
+                                <i class="fa-solid fa-trash-can"></i> Excluir evento
+                            </button>
+                            <?php if (!empty($_GET['erro_exclusao'])): ?>
+                                <span style="color: var(--danger, #dc3545); width: 100%;">Não foi possível excluir. Confira se digitou EXCLUIR corretamente.</span>
+                            <?php endif; ?>
+                        </form>
+                    </details>
+                <?php endif; ?>
             </div>
         </div>
 
@@ -1390,6 +1817,9 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                 $nome = $i['aluno_id'] ? $i['aluno_nome'] : $i['nome_externo'];
                                 $is_interno = (bool) $i['aluno_id'];
                                 $info = $is_interno ? "Interno (" . $i['aluno_faixa'] . ")" : "Externo (" . $i['equipe_externa'] . " - " . $i['faixa_externa'] . ")";
+                                if (!$is_interno && !empty($i['turma_externa'])) {
+                                    $info .= " · Turma/Prof.: " . htmlspecialchars($i['turma_externa']);
+                                }
                                 ?>
                                 <tr style="border-bottom:1px solid var(--border); transition:background 0.2s;"
                                     onmouseover="this.style.background='rgba(235,0,0,0.03)'"
@@ -1606,12 +2036,60 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                 onclick="confirmGerar(event)">SORTEAR
                                 CHAVE ÓLIMPICA</button>
                         </form>
+                        <button type="button" onclick="abrirChaveSimples()" class="btn btn-secondary"
+                            style="height:3rem; padding:0 1.5rem; font-weight:800; border-color:var(--border);">
+                            <i class="fa-solid fa-table-cells"></i> CHAVEAMENTO SIMPLES
+                        </button>
                         <button onclick="imprimirChave()" class="btn btn-secondary"
                             style="height:3rem; font-weight:800; border-color:var(--border);">
                             <i class="fa-solid fa-print"></i> GERAR PDF
                         </button>
+                        <button onclick="exportarChaveXls()" class="btn btn-secondary"
+                            style="height:3rem; font-weight:800; border-color:var(--border);">
+                            <i class="fa-solid fa-file-excel"></i> EXPORTAR XLS
+                        </button>
                     </div>
                 </div>
+            </div>
+
+            <!-- Montagem do Chaveamento Simples -->
+            <div id="painel_simples" class="card" style="display:none; margin-bottom: 2.5rem; border-left:4px solid var(--primary);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.25rem; gap:1rem; flex-wrap:wrap;">
+                    <div>
+                        <h3 style="margin:0;">Chaveamento Simples</h3>
+                        <p style="margin:0.25rem 0 0; color:var(--text-muted); font-size:0.85rem;">
+                            <strong><span id="simples_total">0</span> atleta(s)</strong> inscrito(s) nesta categoria.
+                            Escolha quantos atletas por chave — todos lutam contra todos dentro da própria chave.</p>
+                    </div>
+                    <div style="display:flex; gap:0.75rem; align-items:flex-end;">
+                        <div class="form-group" style="margin-bottom:0;">
+                            <label style="font-size:0.7rem; color:var(--text-muted); text-transform:uppercase; font-weight:700;">Atletas
+                                por chave</label>
+                            <input type="number" id="simples_por_chave" class="form-control" min="2" value="3"
+                                style="width:110px; height:3rem; font-weight:700;">
+                        </div>
+                        <button type="button" onclick="distribuirChaveSimples()" class="btn btn-secondary"
+                            style="height:3rem; font-weight:800; border-color:var(--border);">
+                            <i class="fa-solid fa-shuffle"></i> DISTRIBUIR
+                        </button>
+                    </div>
+                </div>
+
+                <div id="simples_grupos"
+                    style="display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:1rem;"></div>
+
+                <p id="simples_aviso" style="display:none; color:var(--danger); font-weight:700; font-size:0.85rem; margin:1rem 0 0;"></p>
+
+                <form method="POST" id="form_chave_simples"
+                    style="display:flex; justify-content:flex-end; gap:0.5rem; margin-top:1.5rem;">
+                    <input type="hidden" name="gerar_chave_simples" value="1">
+                    <input type="hidden" name="categoria_id_simples" id="simples_cat_id">
+                    <input type="hidden" name="grupos_json" id="simples_grupos_json">
+                    <button type="button" onclick="fecharChaveSimples()" class="btn btn-secondary"
+                        style="height:3rem; font-weight:800;">CANCELAR</button>
+                    <button type="submit" onclick="confirmGerarSimples(event)" class="btn btn-primary"
+                        style="height:3rem; padding:0 2rem; font-weight:800;">GERAR CHAVEAMENTO SIMPLES</button>
+                </form>
             </div>
 
             <div id="canvas_chaves"
@@ -1628,42 +2106,85 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
 
         <!-- FINANCEIRO -->
         <div id="financeiro" class="tab-content" style="display:none;">
-            <!-- Row 1: Stats -->
-            <div
-                style="display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:1.5rem; margin-bottom:2rem;">
-                <div class="stat-card"
-                    style=" display: flex; flex-direction: column; align-items: flex-start; padding: 1.5rem;">
-                    <span
-                        style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 0.5rem;">Receitas
-                        Totais</span>
-                    <p style="font-size:1.75rem; font-weight:800; color: var(--success); margin: 0;">R$
-                        <?php echo number_format($total_receita, 2, ',', '.'); ?>
-                    </p>
-                    <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.5rem;">Inscrições +
-                        Patrocínios + Extras</span>
+            <?php $fmt = function ($v) { return 'R$ ' . number_format((float) $v, 2, ',', '.'); }; ?>
+            <style>
+                .fin-kpis { display:grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap:1rem; margin-bottom:1.25rem; }
+                .fin-kpi { background:#fff; border:1px solid var(--border); padding:1.25rem 1.5rem; display:flex; flex-direction:column; gap:0.35rem; }
+                .fin-kpi .rot { font-size:0.7rem; color:var(--text-muted); font-weight:700; text-transform:uppercase; letter-spacing:0.04em; }
+                .fin-kpi .val { font-size:1.6rem; font-weight:800; margin:0; line-height:1.1; }
+                .fin-kpi .det { font-size:0.7rem; color:var(--text-muted); line-height:1.5; }
+                .fin-atalhos { display:flex; flex-wrap:wrap; gap:0.5rem; margin-bottom:1.5rem; }
+                .fin-atalhos a, .fin-atalhos button { display:inline-flex; align-items:center; gap:0.4rem; background:#fff; border:1px solid var(--border); color:var(--text-main); padding:0.55rem 0.9rem; font-size:0.75rem; font-weight:700; text-transform:uppercase; text-decoration:none; cursor:pointer; }
+                .fin-atalhos a:hover, .fin-atalhos button:hover { border-color:var(--primary); color:var(--primary); }
+                .fin-rel th { padding:0.6rem 0.5rem; font-size:0.65rem; color:var(--text-muted); text-transform:uppercase; text-align:right; border-bottom:1px solid var(--border); }
+                .fin-rel th:first-child, .fin-rel td:first-child { text-align:left; }
+                .fin-rel td { padding:0.6rem 0.5rem; font-size:0.8rem; text-align:right; border-bottom:1px solid var(--border); }
+                .fin-rel tfoot td { font-weight:800; background:#f8fafc; }
+                .fin-filtro button { background:#fff; border:1px solid var(--border); padding:0.3rem 0.7rem; font-size:0.65rem; font-weight:700; text-transform:uppercase; cursor:pointer; }
+                .fin-filtro button.ativo { background:var(--primary); color:#fff; border-color:var(--primary); }
+                @media print {
+                    body * { visibility:hidden; }
+                    #financeiro, #financeiro * { visibility:visible; }
+                    #financeiro { position:absolute; left:0; top:0; width:100%; display:block !important; }
+                    .fin-atalhos, #financeiro form, #financeiro .fin-filtro, #financeiro .fin-sem-print { display:none !important; }
+                    #financeiro [style*="max-height"] { max-height:none !important; overflow:visible !important; }
+                }
+            </style>
+
+            <!-- Row 1: Indicadores -->
+            <div class="fin-kpis">
+                <div class="fin-kpi">
+                    <span class="rot">Receitas totais</span>
+                    <p class="val" style="color:var(--success);"><?php echo $fmt($total_receita); ?></p>
+                    <span class="det">Inscrições <?php echo $fmt($fin_receita_inscricoes); ?><br>
+                        Patrocínios <?php echo $fmt($fin_patrocinios); ?> · Extras <?php echo $fmt($fin_extras_receita); ?></span>
                 </div>
-                <div class="stat-card"
-                    style=" display: flex; flex-direction: column; align-items: flex-start; padding: 1.5rem;">
-                    <span
-                        style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 0.5rem;">Despesas
-                        Totais</span>
-                    <p style="font-size:1.75rem; font-weight:800; color: var(--danger); margin: 0;">R$
-                        <?php echo number_format($total_despesa, 2, ',', '.'); ?>
-                    </p>
-                    <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.5rem;">Custos
-                        operacionais registrados</span>
+                <div class="fin-kpi">
+                    <span class="rot">Despesas totais</span>
+                    <p class="val" style="color:var(--danger);"><?php echo $fmt($total_despesa); ?></p>
+                    <span class="det">Operacionais <?php echo $fmt($fin_extras_despesa); ?><br>
+                        Custos de inscrição <?php echo $fmt($fin_custos_inscricao); ?> (<?php echo $fin_insc_pagas; ?> × <?php echo $fmt(CUSTO_INSCRICAO_EVENTO); ?>)</span>
                 </div>
-                <div class="stat-card"
-                    style=" display: flex; flex-direction: column; align-items: flex-start; padding: 1.5rem;">
-                    <span
-                        style="font-size: 0.75rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; margin-bottom: 0.5rem;">Saldo
-                        do Evento</span>
-                    <p style="font-size:1.75rem; font-weight:800; color: var(--primary); margin: 0;">R$
-                        <?php echo number_format($total_receita - $total_despesa, 2, ',', '.'); ?>
-                    </p>
-                    <span style="font-size: 0.7rem; color: var(--text-muted); margin-top: 0.5rem;">Balanço
-                        consolidado atual</span>
+                <div class="fin-kpi">
+                    <span class="rot">Saldo do evento</span>
+                    <p class="val" style="color:<?php echo ($total_receita - $total_despesa) < 0 ? 'var(--danger)' : 'var(--primary)'; ?>;"><?php echo $fmt($total_receita - $total_despesa); ?></p>
+                    <span class="det">Receitas − despesas − custos<br>
+                        Projetado c/ pendentes: <?php echo $fmt($total_receita - $total_despesa + $fin_a_receber - $fin_insc_pendentes * CUSTO_INSCRICAO_EVENTO); ?></span>
                 </div>
+                <div class="fin-kpi">
+                    <span class="rot">A receber</span>
+                    <p class="val" style="color:#d97706;"><?php echo $fmt($fin_a_receber); ?></p>
+                    <span class="det"><?php echo $fin_insc_pendentes; ?> inscrição(ões) pendente(s)</span>
+                </div>
+                <div class="fin-kpi">
+                    <span class="rot">Inscrições pagas</span>
+                    <p class="val"><?php echo $fin_insc_pagas; ?><span style="font-size:0.9rem; color:var(--text-muted); font-weight:600;"> / <?php echo count($inscritos); ?></span></p>
+                    <span class="det">Ticket médio <?php echo $fmt($fin_ticket_medio); ?><br>
+                        Líquido médio <?php echo $fmt($fin_insc_pagas ? ($fin_receita_inscricoes - $fin_custos_inscricao) / $fin_insc_pagas : 0); ?></span>
+                </div>
+                <div class="fin-kpi">
+                    <span class="rot">Lote vigente</span>
+                    <?php if ($fin_lote_vigente): ?>
+                        <p class="val" style="font-size:1.2rem;"><?php echo htmlspecialchars($fin_lote_vigente['nome']); ?></p>
+                        <span class="det"><?php echo $fmt($fin_lote_vigente['valor']); ?> até <?php echo date('d/m/Y', strtotime($fin_lote_vigente['data_limite'])); ?><br>
+                            Líquido <?php echo $fmt(max(0, $fin_lote_vigente['valor'] - CUSTO_INSCRICAO_EVENTO)); ?></span>
+                    <?php else: ?>
+                        <p class="val" style="font-size:1.2rem; color:var(--danger);">Nenhum</p>
+                        <span class="det"><?php echo $lotes ? 'Todos os lotes já venceram.' : 'Cadastre um lote abaixo.'; ?></span>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- Atalhos -->
+            <div class="fin-atalhos">
+                <button type="button" onclick="finIrPara('fin_controle', 'pendente')"><i class="fa-solid fa-hourglass-half"></i> Pendentes (<?php echo $fin_insc_pendentes; ?>)</button>
+                <button type="button" onclick="finIrPara('form_lote', null, 'lote_field_nome')"><i class="fa-solid fa-tags"></i> Novo lote</button>
+                <button type="button" onclick="finIrPara('fin_patrocinio', null, 'patr_field_empresa')"><i class="fa-solid fa-handshake"></i> Novo patrocínio</button>
+                <button type="button" onclick="finIrPara('form_lancamento', null, 'lanc_field_desc')"><i class="fa-solid fa-plus"></i> Novo lançamento</button>
+                <button type="button" onclick="finIrPara('fin_relatorios')"><i class="fa-solid fa-chart-column"></i> Relatórios</button>
+                <a href="exportar_competicao_xls.php?id=<?php echo (int) $id; ?>&tipo=financeiro"><i class="fa-solid fa-file-excel"></i> Exportar Excel</a>
+                <button type="button" onclick="window.print()"><i class="fa-solid fa-print"></i> Imprimir</button>
+                <button type="button" onclick="openTab(null, 'inscricoes')"><i class="fa-solid fa-users"></i> Inscrições</button>
             </div>
 
             <!-- Row 2: Lotes and Sponsorships -->
@@ -1688,6 +2209,9 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                     placeholder="Nome do Lote" required>
                                 <input type="text" name="lote_valor" id="lote_field_valor" class="form-control"
                                     placeholder="R$ 0,00" required>
+                            </div>
+                            <div id="lote_liquido_preview" style="font-size: 0.75rem; color: var(--text-muted); margin: -0.25rem 0 0.75rem; text-align: right;">
+                                Custos da inscrição: R$ <?php echo number_format(CUSTO_INSCRICAO_EVENTO, 2, ',', '.'); ?> por inscrição
                             </div>
                             <div style="display:grid; grid-template-columns: 1fr auto; gap: 0.75rem;">
                                 <input type="date" name="lote_data" id="lote_field_data" class="form-control">
@@ -1727,6 +2251,14 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                         </td>
                                         <td style="padding:0.75rem 0; color:var(--primary); font-weight:700;">R$
                                             <?php echo number_format($l['valor'], 2, ',', '.'); ?>
+                                            <?php $liquido_lote = max(0, (float) $l['valor'] - CUSTO_INSCRICAO_EVENTO); ?>
+                                            <div style="font-size: 0.7rem; color: var(--success, #16a34a); font-weight: 700;"
+                                                title="Valor do lote menos R$ <?php echo number_format(CUSTO_INSCRICAO_EVENTO, 2, ',', '.'); ?> de custos da inscrição">
+                                                Líquido: R$ <?php echo number_format($liquido_lote, 2, ',', '.'); ?>
+                                            </div>
+                                            <div style="font-size: 0.65rem; color: var(--text-muted); font-weight: 500;">
+                                                − R$ <?php echo number_format(CUSTO_INSCRICAO_EVENTO, 2, ',', '.'); ?> custos
+                                            </div>
                                         </td>
                                         <td style="padding:0.75rem 0; text-align: right;">
                                             <div style="display:flex; gap:0.4rem; justify-content: flex-end;">
@@ -1756,14 +2288,14 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                         <h3 style="margin: 0; font-size: 1rem;">Patrocínios e Parcerias</h3>
                     </div>
                     <div style="padding: 1.5rem;">
-                        <form method="POST"
+                        <form method="POST" id="fin_patrocinio"
                             style="background: #fff; padding: 1.25rem; border-radius: 0; margin-bottom: 1.5rem; border: 1px solid var(--border);">
                             <input type="hidden" name="novo_patrocinio" value="1">
                             <h4
                                 style="margin-top: 0; margin-bottom: 1rem; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">
                                 Registrar Novo Patrocínio</h4>
                             <div class="form-group" style="margin-bottom: 0.75rem;">
-                                <input type="text" name="patr_empresa" class="form-control"
+                                <input type="text" name="patr_empresa" id="patr_field_empresa" class="form-control"
                                     placeholder="Empresa Parceira" required>
                             </div>
                             <div style="display:grid; grid-template-columns: 1fr 120px auto; gap: 0.75rem;">
@@ -1822,26 +2354,33 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                         <h3 style="margin: 0; font-size: 1rem;">Outros Lançamentos (Eventuais)</h3>
                     </div>
                     <div style="padding: 1.5rem;">
-                        <form method="POST"
+                        <form method="POST" id="form_lancamento"
                             style="background: #fff; padding: 1.25rem; border-radius: 0; margin-bottom: 1.5rem; border: 1px solid var(--border);">
                             <input type="hidden" name="novo_lancamento" value="1">
-                            <h4
+                            <input type="hidden" name="edit_lanc_id" id="edit_lanc_id" value="">
+                            <h4 id="lanc_form_title"
                                 style="margin-top: 0; margin-bottom: 1rem; font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">
                                 Novo Lançamento Extra</h4>
                             <div
                                 style="display:grid; grid-template-columns: 100px 1fr; gap: 0.75rem; margin-bottom: 0.75rem;">
-                                <select name="fin_tipo" class="form-control">
+                                <select name="fin_tipo" id="lanc_field_tipo" class="form-control">
                                     <option value="receita">Receita</option>
                                     <option value="despesa">Despesa</option>
                                 </select>
-                                <input type="text" name="fin_desc" class="form-control"
+                                <input type="text" name="fin_desc" id="lanc_field_desc" class="form-control"
                                     placeholder="Descrição (Ex: Aluguel, Troféus...)" required>
                             </div>
-                            <div style="display:grid; grid-template-columns: 1fr auto; gap: 0.75rem;">
-                                <input type="text" name="fin_valor" class="form-control" placeholder="Valor R$ 0,00"
-                                    required>
-                                <button type="submit" class="btn btn-primary" style="padding: 0 1.5rem;">LANÇAR</button>
+                            <div style="display:grid; grid-template-columns: 1fr 1fr auto; gap: 0.75rem;">
+                                <input type="text" name="fin_valor" id="lanc_field_valor" class="form-control"
+                                    placeholder="Valor R$ 0,00" required>
+                                <input type="date" name="fin_data" id="lanc_field_data" class="form-control"
+                                    value="<?php echo date('Y-m-d'); ?>">
+                                <button type="submit" id="btn_lanc_save" class="btn btn-primary"
+                                    style="padding: 0 1.5rem;">LANÇAR</button>
                             </div>
+                            <button type="button" id="btn_cancel_lanc" class="btn btn-secondary"
+                                style="display:none; margin-top:0.75rem; width:100%;"
+                                onclick="cancelLancEdit()">Cancelar Edição</button>
                         </form>
 
                         <div style="max-height: 300px; overflow-y: auto;">
@@ -1851,12 +2390,13 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                         style="text-align:left; color:var(--text-muted); font-size:0.7rem; text-transform:uppercase; border-bottom: 1px solid var(--border);">
                                         <th style="padding: 0.75rem 0;">Data / Descrição</th>
                                         <th style="padding: 0.75rem 0; text-align: right;">Valor</th>
+                                        <th style="padding: 0.75rem 0; text-align: right;">Ações</th>
                                     </tr>
                                 </thead>
                                 <tbody>
                                     <?php if (empty($lancamentos)): ?>
                                         <tr>
-                                            <td colspan="2"
+                                            <td colspan="3"
                                                 style="text-align:center; padding:1.5rem; color:var(--text-muted); font-size: 0.85rem;">
                                                 Sem lançamentos extras.</td>
                                         </tr>
@@ -1876,6 +2416,21 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                                 <?php echo $l['tipo'] == 'receita' ? '+' : '-'; ?> R$
                                                 <?php echo number_format($l['valor'], 2, ',', '.'); ?>
                                             </td>
+                                            <td style="padding:0.75rem 0 0.75rem 0.5rem; text-align: right;">
+                                                <div style="display:flex; gap:0.4rem; justify-content: flex-end;">
+                                                    <button type="button"
+                                                        onclick='editLancamento(<?php echo json_encode($l, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)'
+                                                        class="btn btn-secondary"
+                                                        style="padding:0.3rem 0.6rem; font-size:0.65rem;">EDITAR</button>
+                                                    <form method="POST" style="display:inline;"
+                                                        onsubmit="return confirm('Excluir este lançamento?')">
+                                                        <input type="hidden" name="lanc_delete_id"
+                                                            value="<?php echo $l['id']; ?>">
+                                                        <button type="submit" name="remover_lancamento" class="btn"
+                                                            style="background:rgba(239, 68, 68, 0.1); color:var(--danger); padding:0.3rem 0.6rem; font-size:0.65rem; border:none; border-radius: 0; font-weight: 700;">REMOVER</button>
+                                                    </form>
+                                                </div>
+                                            </td>
                                         </tr>
                                     <?php endforeach; ?>
                                 </tbody>
@@ -1886,8 +2441,13 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
 
                 <!-- PAGAMENTOS INSCRICOES -->
                 <div class="card" style="padding: 0; overflow: hidden;">
-                    <div style="padding: 1.5rem; border-bottom: 1px solid var(--border);">
+                    <div id="fin_controle" style="padding: 1.5rem; border-bottom: 1px solid var(--border); display:flex; flex-wrap:wrap; gap:0.75rem; justify-content:space-between; align-items:center;">
                         <h3 style="margin: 0; font-size: 1rem;">Controle de Inscrições</h3>
+                        <div class="fin-filtro" style="display:flex; gap:0.25rem;">
+                            <button type="button" class="ativo" data-filtro="todos">Todos (<?php echo count($inscritos); ?>)</button>
+                            <button type="button" data-filtro="pago">Pagos (<?php echo $fin_insc_pagas; ?>)</button>
+                            <button type="button" data-filtro="pendente">Pendentes (<?php echo $fin_insc_pendentes; ?>)</button>
+                        </div>
                     </div>
                     <div style="padding: 1.5rem;">
                         <div style="max-height: 480px; overflow-y: auto;">
@@ -1911,13 +2471,14 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                     <?php foreach ($inscritos as $ins):
                                         $at_nome = $ins['aluno_id'] ? $ins['aluno_nome'] : $ins['nome_externo'];
                                         ?>
-                                        <tr style="border-bottom:1px solid var(--border);">
+                                        <tr class="fin-linha-insc" data-status="<?php echo $ins['status_pagamento'] === 'pago' ? 'pago' : 'pendente'; ?>" style="border-bottom:1px solid var(--border);">
                                             <td style="padding:0.75rem 0;">
                                                 <div style="font-weight:700; font-size: 0.85rem;">
                                                     <?php echo htmlspecialchars($at_nome); ?>
                                                 </div>
                                                 <div style="font-size: 0.7rem; color: var(--text-muted);">
                                                     <?php echo htmlspecialchars($ins['cat_nome'] ?: 'Sem Categoria'); ?>
+                                                    · <?php echo htmlspecialchars($ins['aluno_id'] ? $fin_nome_casa : ($ins['equipe_externa'] ?: 'Externo')); ?>
                                                 </div>
                                             </td>
                                             <td style="padding:0.75rem 0;">
@@ -1951,6 +2512,113 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                     </div> <!-- padding -->
                 </div> <!-- card -->
             </div> <!-- grid row 3 -->
+
+            <!-- Relatórios -->
+            <div id="fin_relatorios" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap:1.5rem; margin-top:1.5rem;">
+                <div class="card" style="padding:0; overflow:hidden;">
+                    <div style="padding:1.25rem 1.5rem; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1rem;">Demonstrativo do Evento</h3>
+                    </div>
+                    <div style="padding:1rem 1.5rem 1.5rem;">
+                        <table class="fin-rel" style="width:100%; border-collapse:collapse;">
+                            <tbody>
+                                <tr><td>(+) Inscrições pagas (<?php echo $fin_insc_pagas; ?>)</td><td style="color:var(--success);"><?php echo $fmt($fin_receita_inscricoes); ?></td></tr>
+                                <tr><td>(+) Patrocínios (<?php echo count($patrocinios); ?>)</td><td style="color:var(--success);"><?php echo $fmt($fin_patrocinios); ?></td></tr>
+                                <tr><td>(+) Outras receitas</td><td style="color:var(--success);"><?php echo $fmt($fin_extras_receita); ?></td></tr>
+                                <tr><td>(−) Custos de inscrição (<?php echo $fin_insc_pagas; ?> × <?php echo $fmt(CUSTO_INSCRICAO_EVENTO); ?>)</td><td style="color:var(--danger);"><?php echo $fmt($fin_custos_inscricao); ?></td></tr>
+                                <tr><td>(−) Despesas operacionais</td><td style="color:var(--danger);"><?php echo $fmt($fin_extras_despesa); ?></td></tr>
+                            </tbody>
+                            <tfoot>
+                                <tr><td>(=) Saldo realizado</td><td><?php echo $fmt($total_receita - $total_despesa); ?></td></tr>
+                                <tr><td style="font-weight:600;">A receber (<?php echo $fin_insc_pendentes; ?> pendentes, líquido)</td><td style="color:#d97706;"><?php echo $fmt(max(0, $fin_a_receber - $fin_insc_pendentes * CUSTO_INSCRICAO_EVENTO)); ?></td></tr>
+                                <tr><td>(=) Saldo projetado</td><td><?php echo $fmt($total_receita - $total_despesa + $fin_a_receber - $fin_insc_pendentes * CUSTO_INSCRICAO_EVENTO); ?></td></tr>
+                            </tfoot>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" style="padding:0; overflow:hidden;">
+                    <div style="padding:1.25rem 1.5rem; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1rem;">Resultado por Lote</h3>
+                    </div>
+                    <div style="padding:1rem 1.5rem 1.5rem; overflow-x:auto;">
+                        <table class="fin-rel" style="width:100%; border-collapse:collapse;">
+                            <thead><tr><th>Lote</th><th>Pagas</th><th>Pend.</th><th>Bruto</th><th>Custos</th><th>Líquido</th><th>A receber</th></tr></thead>
+                            <tbody>
+                                <?php if (!$fin_por_lote): ?>
+                                    <tr><td colspan="7" style="text-align:center; color:var(--text-muted);">Sem inscrições ainda.</td></tr>
+                                <?php endif; ?>
+                                <?php foreach ($fin_por_lote as $rl): ?>
+                                    <tr>
+                                        <td><strong><?php echo htmlspecialchars($rl['nome']); ?></strong><?php if ($rl['valor'] !== null): ?><div style="font-size:0.65rem; color:var(--text-muted);"><?php echo $fmt($rl['valor']); ?></div><?php endif; ?></td>
+                                        <td><?php echo $rl['pagas']; ?></td>
+                                        <td><?php echo $rl['pendentes']; ?></td>
+                                        <td><?php echo $fmt($rl['bruto']); ?></td>
+                                        <td style="color:var(--danger);"><?php echo $fmt($rl['custos']); ?></td>
+                                        <td style="color:var(--success); font-weight:700;"><?php echo $fmt($rl['bruto'] - $rl['custos']); ?></td>
+                                        <td style="color:#d97706;"><?php echo $fmt($rl['a_receber']); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                            <?php if ($fin_por_lote): ?>
+                                <tfoot><tr>
+                                    <td>Total</td><td><?php echo $fin_insc_pagas; ?></td><td><?php echo $fin_insc_pendentes; ?></td>
+                                    <td><?php echo $fmt($fin_receita_inscricoes); ?></td><td><?php echo $fmt($fin_custos_inscricao); ?></td>
+                                    <td><?php echo $fmt($fin_receita_inscricoes - $fin_custos_inscricao); ?></td><td><?php echo $fmt($fin_a_receber); ?></td>
+                                </tr></tfoot>
+                            <?php endif; ?>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" style="padding:0; overflow:hidden; grid-column: 1 / -1;">
+                    <div style="padding:1.25rem 1.5rem; border-bottom:1px solid var(--border);">
+                        <h3 style="margin:0; font-size:1rem;">Por Delegação / Equipe</h3>
+                    </div>
+                    <div style="padding:1rem 1.5rem 1.5rem; overflow-x:auto;">
+                        <table class="fin-rel" style="width:100%; border-collapse:collapse;">
+                            <thead><tr><th>Delegação / Equipe</th><th>Inscritos</th><th>Pagas</th><th>Pendentes</th><th>Recebido</th><th>Líquido</th><th>A receber</th></tr></thead>
+                            <tbody>
+                                <?php if (!$fin_por_equipe): ?>
+                                    <tr><td colspan="7" style="text-align:center; color:var(--text-muted);">Sem inscrições ainda.</td></tr>
+                                <?php endif; ?>
+                                <?php foreach ($fin_por_equipe as $nome_eq => $re): ?>
+                                    <tr>
+                                        <td><strong><?php echo htmlspecialchars($nome_eq); ?></strong></td>
+                                        <td><?php echo $re['pagas'] + $re['pendentes']; ?></td>
+                                        <td><?php echo $re['pagas']; ?></td>
+                                        <td><?php echo $re['pendentes']; ?></td>
+                                        <td><?php echo $fmt($re['bruto']); ?></td>
+                                        <td style="color:var(--success); font-weight:700;"><?php echo $fmt($re['bruto'] - $re['custos']); ?></td>
+                                        <td style="color:#d97706;"><?php echo $fmt($re['a_receber']); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <script>
+                // Atalhos: rola até o bloco, opcionalmente filtra o controle e foca um campo
+                function finIrPara(alvoId, filtro, focoId) {
+                    var alvo = document.getElementById(alvoId);
+                    if (filtro) finFiltrar(filtro);
+                    if (alvo) alvo.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    if (focoId) setTimeout(function () { var f = document.getElementById(focoId); if (f) f.focus(); }, 400);
+                }
+                function finFiltrar(filtro) {
+                    document.querySelectorAll('.fin-filtro button').forEach(function (b) {
+                        b.classList.toggle('ativo', b.getAttribute('data-filtro') === filtro);
+                    });
+                    document.querySelectorAll('.fin-linha-insc').forEach(function (tr) {
+                        tr.style.display = (filtro === 'todos' || tr.getAttribute('data-status') === filtro) ? '' : 'none';
+                    });
+                }
+                document.querySelectorAll('.fin-filtro button').forEach(function (b) {
+                    b.addEventListener('click', function () { finFiltrar(b.getAttribute('data-filtro')); });
+                });
+            </script>
         </div> <!-- financeiro tab -->
 
         <!-- PESAGEM -->
@@ -1971,6 +2639,9 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                         </select>
                         <button onclick="imprimirPesagem()" class="btn btn-primary" style="font-weight:800;">
                             <i class="fa-solid fa-print"></i> GERAR PDF DE PESAGEM
+                        </button>
+                        <button onclick="exportarPesagemXls()" class="btn btn-secondary" style="font-weight:800;">
+                            <i class="fa-solid fa-file-excel"></i> EXPORTAR XLS
                         </button>
                     </div>
                 </div>
@@ -2221,6 +2892,9 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                 style="padding:1rem; text-transform:uppercase; font-size:0.7rem; color:var(--text-muted);">
                                 Peso Limite</th>
                             <th
+                                style="padding:1rem; text-transform:uppercase; font-size:0.7rem; color:var(--text-muted);">
+                                Atletas</th>
+                            <th
                                 style="padding:1rem; text-transform:uppercase; font-size:0.7rem; color:var(--text-muted); text-align: center;">
                                 Ações</th>
                         </tr>
@@ -2228,7 +2902,7 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                     <tbody>
                         <?php if (empty($categorias)): ?>
                             <tr>
-                                <td colspan="5" style="text-align:center; padding:2rem; color:var(--text-muted);">
+                                <td colspan="6" style="text-align:center; padding:2rem; color:var(--text-muted);">
                                     Nenhuma categoria cadastrada.</td>
                             </tr>
                         <?php endif; ?>
@@ -2239,11 +2913,11 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                         <?php echo htmlspecialchars($cat['nome']); ?>
                                     </div>
                                     <div style="font-size:0.65rem; color:#08153a; text-transform:uppercase; font-weight:600;">
-                                        <?php echo $cat['sexo']; ?>
+                                        <?php echo $cat['sexo'] === 'unissex' ? 'Masc/Fem' : $cat['sexo']; ?>
                                     </div>
                                 </td>
                                 <td style="padding:1rem; font-size:0.8rem;">
-                                    <?php echo ($cat['ano_nascimento_min'] ?: '∞') . ' a ' . ($cat['ano_nascimento_max'] ?: '∞'); ?>
+                                    <?php echo implode(' a ', array_filter([$cat['ano_nascimento_min'], $cat['ano_nascimento_max']])); ?>
                                 </td>
                                 <td style="padding:1rem; font-size:0.8rem;">
                                     <?php echo $cat['faixas'] ?: 'Livre'; ?>
@@ -2251,7 +2925,41 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
                                 <td style="padding:1rem; font-weight:800; color:var(--danger);">
                                     <?php echo $cat['peso_max'] ? $cat['peso_max'] . 'kg' : 'Livre'; ?>
                                 </td>
+                                <td style="padding:1rem; font-size:0.75rem;">
+                                    <?php if ($cat['limite_atletas']): ?>
+                                        <div
+                                            style="font-weight:700; <?php echo $cat['total_pagos'] >= $cat['limite_atletas'] ? 'color:var(--danger);' : ''; ?>">
+                                            <i class="fa-solid fa-circle-check" style="color:#16a34a;"></i>
+                                            Pagos: <?php echo (int) $cat['total_pagos']; ?> / <?php echo (int) $cat['limite_atletas']; ?>
+                                            <?php if ($cat['total_pagos'] >= $cat['limite_atletas']): ?>
+                                                <span class="badge badge-inativo" style="font-size:0.55rem; margin-left:0.3rem;">LOTADA</span>
+                                            <?php endif; ?>
+                                        </div>
+                                        <?php if ($cat['total_pendentes'] > 0): ?>
+                                            <div style="color:var(--text-muted); margin-top:0.15rem;">
+                                                <i class="fa-solid fa-hourglass-half" style="color:#eab308;"></i>
+                                                Aguardando pagamento: <?php echo (int) $cat['total_pendentes']; ?>
+                                            </div>
+                                        <?php endif; ?>
+                                    <?php else: ?>
+                                        <div><i class="fa-solid fa-circle-check" style="color:#16a34a;"></i> Pagos: <?php echo (int) $cat['total_pagos']; ?> / Livre</div>
+                                        <?php if ($cat['total_pendentes'] > 0): ?>
+                                            <div style="color:var(--text-muted); margin-top:0.15rem;">
+                                                <i class="fa-solid fa-hourglass-half" style="color:#eab308;"></i>
+                                                Aguardando pagamento: <?php echo (int) $cat['total_pendentes']; ?>
+                                            </div>
+                                        <?php endif; ?>
+                                    <?php endif; ?>
+                                </td>
                                 <td style="padding:1rem; text-align: center;">
+                                    <button type="button"
+                                        onclick='editarCategoria(<?php echo json_encode($cat); ?>)'
+                                        class="btn"
+                                        style="background:rgba(8,21,58,0.05); color:#08153a; padding:0.4rem 0.6rem; border:none; border-radius: 0; transition: 0.2s; margin-right:0.4rem;"
+                                        onmouseover="this.style.background='rgba(8,21,58,0.1)'"
+                                        onmouseout="this.style.background='rgba(8,21,58,0.05)'">
+                                        <i class="fa-solid fa-pen"></i>
+                                    </button>
                                     <button type="button"
                                         onclick="if(confirm('Excluir categoria?')) { window.location.href='editar_competicao.php?id=<?php echo $id; ?>&remover_categoria=<?php echo $cat['id']; ?>&tab=categorias'; }"
                                         class="btn"
@@ -2268,53 +2976,66 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
             </div>
 
             <div style="background: #f8fafc; border: 1px dashed var(--primary); padding: 1.5rem; border-radius: 0;">
-                <h5
+                <h5 id="form-cat-titulo"
                     style="margin-bottom:1.5rem; font-size:0.75rem; color:#08153a; font-weight: 800; text-transform: uppercase;">
                     <i class="fa-solid fa-plus-circle"></i> Adicionar Configuração de Categoria
                 </h5>
-                <form method="POST" action="editar_competicao.php?id=<?php echo $id; ?>&tab=categorias">
+                <form method="POST" action="editar_competicao.php?id=<?php echo $id; ?>&tab=categorias" id="form-categoria">
                     <input type="hidden" name="nova_categoria" value="1">
+                    <input type="hidden" name="cat_id_editar" id="cat_id_editar" value="">
                     <div id="form-cat-inline"
-                        style="display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1.5fr 1fr auto; gap: 1rem; align-items: end;">
+                        style="display: grid; grid-template-columns: 2fr 1.8fr 1fr 1fr 1.5fr 1fr 1fr auto; gap: 1rem; align-items: end;">
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">NOME</label>
-                            <input type="text" name="nome" class="form-control" required
+                            <input type="text" name="nome" id="cat_nome" class="form-control" required
                                 placeholder="Ex: Mirim I / Pena" style="height:40px; font-size:0.85rem;">
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">GÊNERO</label>
-                            <select name="sexo" class="form-control"
-                                style="height:40px; font-size:0.85rem; font-weight: 600;">
-                                <option value="unissex">Uni</option>
+                            <select name="sexo" id="cat_sexo" class="form-control"
+                                style="height:40px; font-size:0.85rem; font-weight: 600; min-width:150px; width:100%; padding-right:8px !important;">
                                 <option value="masculino">Masc</option>
                                 <option value="feminino">Fem</option>
+                                <option value="unissex">Masc/Fem</option>
                             </select>
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">ANO
                                 MÍN</label>
-                            <input type="number" name="ano_nascimento_min" class="form-control" placeholder="2010"
+                            <input type="number" name="ano_nascimento_min" id="cat_ano_min" class="form-control" placeholder="2010"
                                 style="height:40px; font-size:0.85rem;">
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">ANO
                                 MÁX</label>
-                            <input type="number" name="ano_nascimento_max" class="form-control" placeholder="2015"
+                            <input type="number" name="ano_nascimento_max" id="cat_ano_max" class="form-control" placeholder="2015"
                                 style="height:40px; font-size:0.85rem;">
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">FAIXAS</label>
-                            <input type="text" name="faixas" class="form-control" placeholder="Branca"
+                            <input type="text" name="faixas" id="cat_faixas" class="form-control" placeholder="Branca"
                                 style="height:40px; font-size:0.85rem;">
                         </div>
                         <div class="form-group" style="margin:0;">
                             <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">PESO
                                 (KG)</label>
-                            <input type="number" step="0.1" name="peso_max" class="form-control" placeholder="0.0"
+                            <input type="number" step="0.1" name="peso_max" id="cat_peso_max" class="form-control" placeholder="0.0"
                                 style="height:40px; font-size:0.85rem;">
                         </div>
-                        <button type="submit" class="btn btn-primary" style="height:40px; padding:0 1.25rem;"><i
-                                class="fa-solid fa-plus"></i></button>
+                        <div class="form-group" style="margin:0;">
+                            <label style="font-size:0.6rem; font-weight: 800; color:var(--text-muted);">LIMITE
+                                ATLETAS</label>
+                            <input type="number" min="1" step="1" name="limite_atletas" id="cat_limite_atletas" class="form-control" placeholder="Sem limite"
+                                style="height:40px; font-size:0.85rem;">
+                        </div>
+                        <div style="display:flex; gap:0.5rem;">
+                            <button type="submit" class="btn btn-primary" id="btn-cat-submit" style="height:40px; padding:0 1.25rem;"><i
+                                    class="fa-solid fa-plus"></i></button>
+                            <button type="button" id="btn-cat-cancelar" onclick="cancelarEdicaoCategoria()"
+                                style="display:none; height:40px; padding:0 1rem; border:1px solid var(--border); background:#fff; cursor:pointer;">
+                                Cancelar
+                            </button>
+                        </div>
                     </div>
                 </form>
             </div>
@@ -2336,6 +3057,32 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         } else {
             document.getElementById('btn-' + tabName).classList.add("active");
         }
+    }
+
+    // Coloca o formulário de categorias em modo edição, preenchendo com os dados atuais
+    function editarCategoria(cat) {
+        document.getElementById('cat_id_editar').value = cat.id;
+        document.getElementById('cat_nome').value = cat.nome || '';
+        document.getElementById('cat_sexo').value = cat.sexo || 'masculino';
+        document.getElementById('cat_ano_min').value = cat.ano_nascimento_min || '';
+        document.getElementById('cat_ano_max').value = cat.ano_nascimento_max || '';
+        document.getElementById('cat_faixas').value = cat.faixas || '';
+        document.getElementById('cat_peso_max').value = cat.peso_max || '';
+        document.getElementById('cat_limite_atletas').value = cat.limite_atletas || '';
+
+        document.getElementById('form-cat-titulo').innerHTML = '<i class="fa-solid fa-pen"></i> Editar Configuração de Categoria';
+        document.getElementById('btn-cat-submit').innerHTML = '<i class="fa-solid fa-check"></i>';
+        document.getElementById('btn-cat-cancelar').style.display = 'inline-block';
+
+        document.getElementById('form-categoria').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function cancelarEdicaoCategoria() {
+        document.getElementById('form-categoria').reset();
+        document.getElementById('cat_id_editar').value = '';
+        document.getElementById('form-cat-titulo').innerHTML = '<i class="fa-solid fa-plus-circle"></i> Adicionar Configuração de Categoria';
+        document.getElementById('btn-cat-submit').innerHTML = '<i class="fa-solid fa-plus"></i>';
+        document.getElementById('btn-cat-cancelar').style.display = 'none';
     }
 
     // Categoria Inline Add
@@ -2419,12 +3166,29 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         document.getElementById('form_inscricao').scrollIntoView({ behavior: 'smooth' });
     }
 
+    // Prévia do valor líquido do lote (valor − custos fixos da inscrição)
+    var CUSTO_INSCRICAO_EVENTO = <?php echo json_encode((float) CUSTO_INSCRICAO_EVENTO); ?>;
+    function atualizarLiquidoLote() {
+        var campo = document.getElementById('lote_field_valor');
+        var alvo = document.getElementById('lote_liquido_preview');
+        if (!campo || !alvo) return;
+        var bruto = parseFloat(String(campo.value).replace(/[^\d,.-]/g, '').replace(/\./g, '').replace(',', '.')) || 0;
+        var fmt = function (v) { return v.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };
+        alvo.innerHTML = bruto > 0
+            ? 'R$ ' + fmt(bruto) + ' − R$ ' + fmt(CUSTO_INSCRICAO_EVENTO) + ' custos = <strong style="color: var(--success, #16a34a);">Líquido R$ ' + fmt(Math.max(0, bruto - CUSTO_INSCRICAO_EVENTO)) + '</strong>'
+            : 'Custos da inscrição: R$ ' + fmt(CUSTO_INSCRICAO_EVENTO) + ' por inscrição';
+    }
+    document.addEventListener('input', function (ev) {
+        if (ev.target && ev.target.id === 'lote_field_valor') atualizarLiquidoLote();
+    });
+
     function editLote(data) {
         document.getElementById('lote_form_title').innerText = "Editar Lote";
         document.getElementById('edit_lote_id').value = data.id;
         document.getElementById('lote_field_nome').value = data.nome;
         document.getElementById('lote_field_valor').value = parseFloat(data.valor).toLocaleString('pt-BR', { minimumFractionDigits: 2 });
         document.getElementById('lote_field_data').value = data.data_limite;
+        atualizarLiquidoLote();
         document.getElementById('btn_lote_save').innerText = "Salvar";
         document.getElementById('btn_cancel_lote').style.display = "block";
         document.getElementById('form_lote').scrollIntoView({ behavior: 'smooth' });
@@ -2434,8 +3198,29 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         document.getElementById('lote_form_title').innerText = "Adicionar Lote";
         document.getElementById('edit_lote_id').value = "";
         document.getElementById('form_lote').reset();
+        atualizarLiquidoLote();
         document.getElementById('btn_lote_save').innerText = "+";
         document.getElementById('btn_cancel_lote').style.display = "none";
+    }
+
+    function editLancamento(data) {
+        document.getElementById('lanc_form_title').innerText = "Editar Lançamento";
+        document.getElementById('edit_lanc_id').value = data.id;
+        document.getElementById('lanc_field_tipo').value = data.tipo;
+        document.getElementById('lanc_field_desc').value = data.descricao;
+        document.getElementById('lanc_field_valor').value = parseFloat(data.valor).toLocaleString('pt-BR', { minimumFractionDigits: 2 });
+        document.getElementById('lanc_field_data').value = (data.data_lancamento || '').substring(0, 10);
+        document.getElementById('btn_lanc_save').innerText = "SALVAR";
+        document.getElementById('btn_cancel_lanc').style.display = "block";
+        document.getElementById('form_lancamento').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function cancelLancEdit() {
+        document.getElementById('lanc_form_title').innerText = "Novo Lançamento Extra";
+        document.getElementById('edit_lanc_id').value = "";
+        document.getElementById('form_lancamento').reset();
+        document.getElementById('btn_lanc_save').innerText = "LANÇAR";
+        document.getElementById('btn_cancel_lanc').style.display = "none";
     }
 
     function cancelInscEdit() {
@@ -2478,6 +3263,7 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
 
     async function loadChave(catId) {
         if (!catId) return;
+        fecharChaveSimples();
         const canvas = document.getElementById('canvas_chaves');
         canvas.innerHTML = '<p style="text-align:center; width:100%;">Carregando chave...</p>';
 
@@ -2496,12 +3282,271 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         }
     }
 
+    // ===== Chaveamento Simples =====
+    let lutasAtuais = [];
+    let simplesAtletas = [];
+    let simplesGrupos = [];
+
+    function escHtml(s) {
+        return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function abrirChaveSimples() {
+        const cat = document.getElementById('select_cat_chaves').value;
+        if (!cat) {
+            alert('Selecione uma categoria primeiro!');
+            return;
+        }
+        const painel = document.getElementById('painel_simples');
+        painel.style.display = 'block';
+        document.getElementById('simples_grupos').innerHTML = '<p style="color:var(--text-muted);">Carregando inscritos...</p>';
+
+        try {
+            const resp = await fetch(`editar_competicao.php?id=<?php echo $id; ?>&ajax_elegiveis=1&cat_id=${cat}`);
+            simplesAtletas = await resp.json();
+        } catch (e) {
+            document.getElementById('simples_grupos').innerHTML = '<p style="color:red;">Erro ao carregar inscritos.</p>';
+            return;
+        }
+        document.getElementById('simples_total').innerText = simplesAtletas.length;
+
+        // Se a categoria já tem chaveamento simples, reabre com as chaves atuais para ajuste
+        const existentes = lutasAtuais.filter(l => l.tipo_chave === 'simples');
+        if (existentes.length) {
+            const porId = Object.fromEntries(simplesAtletas.map(a => [a.id, a]));
+            const mapa = {};
+            existentes.forEach(l => {
+                mapa[l.grupo] = mapa[l.grupo] || new Set();
+                mapa[l.grupo].add(String(l.inscricao1_id));
+                mapa[l.grupo].add(String(l.inscricao2_id));
+            });
+            const usados = new Set();
+            simplesGrupos = Object.keys(mapa).sort((a, b) => a - b).map(g =>
+                [...mapa[g]].filter(i => porId[i]).map(i => { usados.add(i); return porId[i]; }));
+            const sobra = simplesAtletas.filter(a => !usados.has(String(a.id)));
+            if (sobra.length) simplesGrupos.push(sobra);
+            renderGruposSimples();
+        } else {
+            distribuirChaveSimples();
+        }
+        painel.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function fecharChaveSimples() {
+        document.getElementById('painel_simples').style.display = 'none';
+    }
+
+    // Divide os atletas (já ordenados por peso) em chaves equilibradas de no máximo N atletas
+    function distribuirChaveSimples() {
+        const porChave = Math.max(2, parseInt(document.getElementById('simples_por_chave').value) || 2);
+        const n = simplesAtletas.length;
+        const qtdChaves = Math.max(1, Math.ceil(n / porChave));
+        const base = Math.floor(n / qtdChaves);
+        const resto = n % qtdChaves;
+
+        simplesGrupos = [];
+        let idx = 0;
+        for (let g = 0; g < qtdChaves; g++) {
+            const tam = base + (g < resto ? 1 : 0);
+            simplesGrupos.push(simplesAtletas.slice(idx, idx + tam));
+            idx += tam;
+        }
+        renderGruposSimples();
+    }
+
+    function moverAtletaSimples(atletaId, origem, destino) {
+        destino = parseInt(destino);
+        if (destino === -1) {
+            simplesGrupos.push([]);
+            destino = simplesGrupos.length - 1;
+        }
+        const i = simplesGrupos[origem].findIndex(a => String(a.id) === String(atletaId));
+        if (i < 0) return;
+        const [atleta] = simplesGrupos[origem].splice(i, 1);
+        simplesGrupos[destino].push(atleta);
+        simplesGrupos = simplesGrupos.filter(g => g.length);
+        renderGruposSimples();
+    }
+
+    function renderGruposSimples() {
+        const box = document.getElementById('simples_grupos');
+        const aviso = document.getElementById('simples_aviso');
+
+        if (!simplesAtletas.length) {
+            box.innerHTML = '<p style="color:var(--text-muted);">Nenhum atleta inscrito nesta categoria.</p>';
+            aviso.style.display = 'none';
+            return;
+        }
+
+        box.innerHTML = simplesGrupos.map((g, gi) => {
+            const lutas = g.length * (g.length - 1) / 2;
+            const linhas = g.map(a => {
+                const opcoes = simplesGrupos.map((_, oi) =>
+                    `<option value="${oi}" ${oi === gi ? 'selected' : ''}>Chave ${oi + 1}</option>`).join('')
+                    + '<option value="-1">+ Nova chave</option>';
+                return `
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; padding:0.5rem 0; border-bottom:1px solid var(--border);">
+                        <div style="min-width:0;">
+                            <div style="font-weight:700; font-size:0.85rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escHtml(a.nome)}</div>
+                            <div style="font-size:0.7rem; color:var(--text-muted);">${escHtml(a.equipe || '--')}${a.peso_atleta ? ' · ' + parseFloat(a.peso_atleta).toLocaleString('pt-BR') + ' kg' : ''}</div>
+                            ${pendenciasSimples(a)}
+                        </div>
+                        <select class="form-control" style="width:auto; height:2rem; font-size:0.75rem; padding:0 0.4rem;"
+                            onchange="moverAtletaSimples('${a.id}', ${gi}, this.value)">${opcoes}</select>
+                    </div>`;
+            }).join('');
+            const invalida = g.length < 2;
+            return `
+                <div style="border:1px solid ${invalida ? 'var(--danger)' : 'var(--border)'}; background:#fff; padding:1rem;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                        <strong style="text-transform:uppercase; font-size:0.85rem;">Chave ${gi + 1}</strong>
+                        <span style="font-size:0.7rem; color:var(--text-muted);">${g.length} atleta(s) · ${lutas} luta(s)</span>
+                    </div>
+                    ${linhas}
+                </div>`;
+        }).join('');
+
+        const problemas = simplesGrupos.map((g, gi) => g.length < 2 ? `Chave ${gi + 1}` : null).filter(Boolean);
+        if (problemas.length) {
+            aviso.innerText = `Cada chave precisa de pelo menos 2 atletas: ${problemas.join(', ')}. Mova atletas ou mude a quantidade por chave.`;
+            aviso.style.display = 'block';
+        } else {
+            aviso.style.display = 'none';
+        }
+    }
+
+    // Aviso (não bloqueia) de pagamento/pesagem pendentes do atleta
+    function pendenciasSimples(a) {
+        const p = [];
+        if (a.status_pagamento !== 'pago') p.push('Pagto ' + (a.status_pagamento || 'pendente'));
+        if (a.pesagem_status !== 'aprovado') p.push('Pesagem ' + (a.pesagem_status || 'pendente'));
+        return p.length
+            ? `<div style="font-size:0.6rem; color:var(--danger); font-weight:700; text-transform:uppercase;">${escHtml(p.join(' · '))}</div>`
+            : '';
+    }
+
+    function confirmGerarSimples(e) {
+        const cat = document.getElementById('select_cat_chaves').value;
+        if (!cat) {
+            alert('Selecione uma categoria primeiro!');
+            e.preventDefault();
+            return;
+        }
+        if (simplesAtletas.length < 2) {
+            alert('É preciso ter pelo menos 2 atletas inscritos nesta categoria.');
+            e.preventDefault();
+            return;
+        }
+        if (!simplesGrupos.length || simplesGrupos.some(g => g.length < 2)) {
+            alert('Cada chave precisa ter pelo menos 2 atletas.');
+            e.preventDefault();
+            return;
+        }
+        if (!confirm('Isso irá apagar as chaves/lutas atuais desta categoria e gerar o chaveamento simples. Continuar?')) {
+            e.preventDefault();
+            return;
+        }
+        document.getElementById('simples_cat_id').value = cat;
+        document.getElementById('simples_grupos_json').value = JSON.stringify(simplesGrupos.map(g => g.map(a => a.id)));
+        document.getElementById('form_chave_simples').action = `editar_competicao.php?id=<?php echo $id; ?>&tab=chaves&cat_id=${cat}`;
+    }
+
+    function renderChavesSimples(lutas) {
+        const canvas = document.getElementById('canvas_chaves');
+        const grupos = {};
+        lutas.forEach(l => {
+            (grupos[l.grupo] = grupos[l.grupo] || []).push(l);
+        });
+
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:1.5rem; width:100%;';
+
+        Object.keys(grupos).sort((a, b) => a - b).forEach(g => {
+            const lista = grupos[g].sort((a, b) => a.fase - b.fase || a.posicao - b.posicao);
+
+            // Classificação: vitórias; empate entre dois atletas é desfeito pelo confronto direto
+            const tabela = {};
+            const addAtleta = (id, nome) => { if (id && !tabela[id]) tabela[id] = { id, nome, v: 0, d: 0 }; };
+            const confronto = {};
+            lista.forEach(l => {
+                addAtleta(l.inscricao1_id, l.i1_nome_int || l.i1_nome_ext);
+                addAtleta(l.inscricao2_id, l.i2_nome_int || l.i2_nome_ext);
+                if (l.vencedor_id) {
+                    const perdedor = l.vencedor_id == l.inscricao1_id ? l.inscricao2_id : l.inscricao1_id;
+                    tabela[l.vencedor_id].v++;
+                    tabela[perdedor].d++;
+                    confronto[l.vencedor_id + '_' + perdedor] = true;
+                }
+            });
+            const classif = Object.values(tabela).sort((a, b) => {
+                if (b.v !== a.v) return b.v - a.v;
+                if (confronto[a.id + '_' + b.id]) return -1;
+                if (confronto[b.id + '_' + a.id]) return 1;
+                return a.d - b.d;
+            });
+            const finalizadas = lista.filter(l => l.vencedor_id).length;
+
+            const lutasHtml = lista.map((l, i) => {
+                const lado = (insc, nome) => {
+                    const venceu = l.vencedor_id && l.vencedor_id == insc;
+                    return `
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem; padding:0.25rem 0; ${venceu ? 'color:var(--success); font-weight:bold;' : ''}">
+                            <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escHtml(nome || '-- Vago --')}</span>
+                            ${insc && !venceu ? `<button type="button" onclick="setVencedor(${l.id}, ${insc})" title="Definir vencedor" style="font-size:0.6rem; padding:0 0.25rem; border:1px solid var(--border); background:#fff; cursor:pointer;">✔</button>` : ''}
+                        </div>`;
+                };
+                return `
+                    <div style="border:1px solid var(--border); padding:0.4rem 0.6rem; margin-bottom:0.5rem; font-size:0.8rem;">
+                        <div style="font-size:0.65rem; color:var(--text-muted); text-transform:uppercase; font-weight:700;">Luta ${i + 1} · Rodada ${l.fase}</div>
+                        ${lado(l.inscricao1_id, l.i1_nome_int || l.i1_nome_ext)}
+                        <div style="border-top:1px solid #eee;"></div>
+                        ${lado(l.inscricao2_id, l.i2_nome_int || l.i2_nome_ext)}
+                    </div>`;
+            }).join('');
+
+            const classifHtml = classif.map((a, i) => `
+                <tr style="border-bottom:1px solid var(--border);">
+                    <td style="padding:0.35rem 0; font-weight:800;">${i + 1}º</td>
+                    <td style="padding:0.35rem 0.5rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:170px;">${escHtml(a.nome)}</td>
+                    <td style="padding:0.35rem 0; text-align:center;">${a.v}</td>
+                    <td style="padding:0.35rem 0; text-align:center;">${a.d}</td>
+                </tr>`).join('');
+
+            const card = document.createElement('div');
+            card.style.cssText = 'background:#fff; border:1px solid var(--border); padding:1rem; box-shadow:var(--shadow-sm);';
+            card.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                    <h4 style="margin:0; text-transform:uppercase;">Chave ${g}</h4>
+                    <span style="font-size:0.7rem; color:var(--text-muted);">${finalizadas}/${lista.length} lutas</span>
+                </div>
+                ${lutasHtml}
+                <table style="width:100%; border-collapse:collapse; margin-top:0.75rem; font-size:0.8rem;">
+                    <thead>
+                        <tr style="text-align:left; color:var(--text-muted); font-size:0.65rem; text-transform:uppercase; border-bottom:1px solid var(--border);">
+                            <th style="padding:0.35rem 0;">Pos.</th><th style="padding:0.35rem 0.5rem;">Atleta</th>
+                            <th style="padding:0.35rem 0; text-align:center;">V</th><th style="padding:0.35rem 0; text-align:center;">D</th>
+                        </tr>
+                    </thead>
+                    <tbody>${classifHtml}</tbody>
+                </table>`;
+            wrap.appendChild(card);
+        });
+
+        canvas.appendChild(wrap);
+    }
+
     function renderChaves(lutas) {
         const canvas = document.getElementById('canvas_chaves');
         canvas.innerHTML = '';
+        lutasAtuais = lutas;
 
         if (lutas.length === 0) {
             canvas.innerHTML = '<p style="text-align:center; width:100%;">Nenhuma chave gerada para esta categoria.</p>';
+            return;
+        }
+
+        if (lutas[0].tipo_chave === 'simples') {
+            renderChavesSimples(lutas);
             return;
         }
 
@@ -2567,6 +3612,15 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         }
         const url = `imprimir.php?id=<?php echo $id; ?>&tipo=chaves&cat_id=${catId}`;
         window.open(url, '_blank');
+    }
+
+    function exportarChaveXls() {
+        const catId = document.getElementById('select_cat_chaves').value;
+        if (!catId) {
+            alert('Selecione uma categoria primeiro!');
+            return;
+        }
+        window.location.href = `exportar_competicao_xls.php?id=<?php echo $id; ?>&tipo=chaves&cat_id=${catId}`;
     }
 
     async function setPesagemStatus(inscId, status) {
@@ -2675,6 +3729,11 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         window.open(url, '_blank');
     }
 
+    function exportarPesagemXls() {
+        const catId = document.getElementById('select_cat_pesagem').value;
+        window.location.href = `exportar_competicao_xls.php?id=<?php echo $id; ?>&tipo=pesagem&cat_id=${catId === 'todas' ? '' : catId}`;
+    }
+
     function filterDocs() {
         const nomeFilter = document.getElementById('filter_nome_docs').value.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
         const catId = document.getElementById('filter_cat_docs').value;
@@ -2716,6 +3775,19 @@ equipe_externa, faixa_externa, valor_pago, status_pagamento) VALUES (?, ?, ?, ?,
         }
         const url = `imprimir.php?id=<?php echo $id; ?>&tipo=${tipo}&insc_ids=${selected.join(',')}`;
         window.open(url, '_blank');
+    }
+
+    // Marca/desmarca uma foto já salva para remoção (efetivada ao salvar o evento)
+    function alternarRemoverFoto(btn, e) {
+        e.preventDefault();
+        e.stopPropagation();
+        const box = btn.closest('.foto-galeria');
+        const chk = box.querySelector('input[name="remover_fotos[]"]');
+        chk.checked = !chk.checked;
+        box.querySelector('img').style.opacity = chk.checked ? '0.25' : '1';
+        box.style.borderColor = chk.checked ? 'var(--danger, #dc2626)' : 'var(--border)';
+        btn.innerHTML = chk.checked ? '<i class="fa-solid fa-rotate-left"></i>' : '<i class="fa-solid fa-xmark"></i>';
+        btn.title = chk.checked ? 'Desfazer remoção' : 'Remover foto';
     }
 
     // --- Lógica de Fotos (Drag & Drop) ---
